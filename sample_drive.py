@@ -7,6 +7,11 @@ import time
 import keyboard
 import select
 import ctypes
+from agent_policy import HeuristicPolicy
+
+# The swappable "brain". To upgrade later, change this one line to a trained
+# policy, e.g.  POLICY = LearnedPolicy("model.onnx")  -- nothing else changes.
+POLICY = HeuristicPolicy()
 
 # ---------------------------------------------------------
 # Configuration
@@ -205,10 +210,14 @@ def processing_task():
     #Remember to use the shared_data to get the latest frame
     with data_lock:
         front_frame = shared_data['latest_front_frame']
-    
+        back_frame = shared_data['latest_back_frame']
+
     if front_frame is not None:
-        # write your processing here
-        pass
+        # Run the swappable policy: BGR frame in -> (steering, acceleration) out.
+        steering, acceleration = POLICY.act(front_frame, back_frame)
+        with data_lock:
+            shared_data['steering_input'] = steering
+            shared_data['acceleration_input'] = acceleration
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
@@ -219,9 +228,10 @@ def send_controls_task():
     #these are the variables used to control the car
     #steering_input: -1.0 to 1.0 (left to right)
     #acceleration_input: -1.0 to 1.0 (reverse to forward)
-    #this example always accelerate forward
-    steering_input = 0.0
-    acceleration_input = 1.0
+    #Read the latest decision produced by processing_task() via shared_data.
+    with data_lock:
+        steering_input = shared_data['steering_input']
+        acceleration_input = shared_data['acceleration_input']
 
     try:
         # Pack and send the control command
