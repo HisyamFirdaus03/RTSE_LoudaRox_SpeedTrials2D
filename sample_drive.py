@@ -257,6 +257,7 @@ def processing_task():
     # so it's safe to use these without holding data_lock).
     lane_info = perception.detect_current_lane(frame_to_process)
     tokens = perception.detect_tokens(frame_to_process)
+    front_obstacles = perception.detect_front_obstacles(frame_to_process)
     rear = perception.detect_rear_events(back_frame)
     brightness = perception.measure_brightness(frame_to_process)
 
@@ -268,6 +269,7 @@ def processing_task():
                 'lane_confidence': lane_info['confidence'],
                 'lane_offset': lane_info['lane_offset'],
                 'tokens': tokens,
+                'obstacles': front_obstacles,
             },
             rear_detection=rear,
             brightness=brightness,

@@ -29,6 +29,11 @@ CONFIG = {
     'road_roi': (0.45, 1.0, 0.0, 1.0),
     'token_roi': (0.25, 0.85, 0.0, 1.0),
     'rear_roi': (0.0, 0.7, 0.0, 1.0),
+    # Front-facing ROI for detecting cars/obstacles ahead in our lane.
+    # Overlaps the top of road_roi (so a close car straddling that boundary
+    # is still caught) and extends higher to pick up smaller, more-distant
+    # cars earlier. STILL NEEDS calibration against the live sim.
+    'front_obstacle_roi': (0.30, 0.55, 0.0, 1.0),
 
     # HSV color ranges as (lower, upper) tuples of (H, S, V).
     # Token ranges below are derived from the lab's reference token artwork
@@ -84,6 +89,9 @@ RearDetection = namedtuple(
     'RearDetection', ['faster_car', 'police_car', 'lane', 'distance_estimate']
 )
 EMPTY_REAR = RearDetection(faster_car=False, police_car=False, lane=None, distance_estimate=None)
+ObstacleDetection = namedtuple(
+    'ObstacleDetection', ['faster_car', 'police_car', 'lane', 'distance_estimate', 'cx', 'cy', 'area']
+)
 
 
 # ---------------------------------------------------------
@@ -131,6 +139,40 @@ def _clean_mask(mask):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     return mask
+
+
+def _find_car_contours(hsv, roi_h, roi_w, cfg):
+    """
+    Shared HSV-mask + car-shaped-contour filter, used by both
+    detect_rear_events and detect_front_obstacles.
+
+    Returns a list of (area, is_police, cx, cy, lane, distance_estimate)
+    tuples for every contour passing the area + aspect-ratio filters, across
+    both the 'faster car' and 'police car' HSV ranges.
+    """
+    candidates = []
+    for is_police, color_range in (
+        (False, cfg['hsv_faster_car']),
+        (True, cfg['hsv_police_car']),
+    ):
+        mask = _clean_mask(_mask_for_range(hsv, color_range))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < cfg['min_car_contour_area']:
+                continue
+            x, y, w, h = cv2.boundingRect(c)
+            if h == 0:
+                continue
+            aspect = w / h
+            if not (cfg['car_min_aspect_ratio'] <= aspect <= cfg['car_max_aspect_ratio']):
+                continue
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+            lane = _classify_lane(cx / roi_w, cfg)
+            distance_estimate = area * (1.0 + cy / roi_h)
+            candidates.append((area, is_police, cx, cy, lane, distance_estimate))
+    return candidates
 
 
 # ---------------------------------------------------------
@@ -342,33 +384,11 @@ def detect_rear_events(back_frame, cfg=CONFIG):
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     roi_h, roi_w = roi_bgr.shape[:2]
 
-    candidates = []
-    for is_police, color_range in (
-        (False, cfg['hsv_faster_car']),
-        (True, cfg['hsv_police_car']),
-    ):
-        mask = _clean_mask(_mask_for_range(hsv, color_range))
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < cfg['min_car_contour_area']:
-                continue
-            x, y, w, h = cv2.boundingRect(c)
-            if h == 0:
-                continue
-            aspect = w / h
-            if not (cfg['car_min_aspect_ratio'] <= aspect <= cfg['car_max_aspect_ratio']):
-                continue
-            cx = x + w / 2.0
-            cy = y + h / 2.0
-            candidates.append((area, is_police, cx, cy))
-
+    candidates = _find_car_contours(hsv, roi_h, roi_w, cfg)
     if not candidates:
         return EMPTY_REAR
 
-    area, is_police, cx, cy = max(candidates, key=lambda t: t[0])
-    lane = _classify_lane(cx / roi_w, cfg)
-    distance_estimate = area * (1.0 + cy / roi_h)
+    area, is_police, cx, cy, lane, distance_estimate = max(candidates, key=lambda t: t[0])
 
     return RearDetection(
         faster_car=not is_police,
@@ -376,6 +396,43 @@ def detect_rear_events(back_frame, cfg=CONFIG):
         lane=lane,
         distance_estimate=distance_estimate,
     )
+
+
+# ---------------------------------------------------------
+# Front obstacle detection
+#
+# Cars/obstacles directly ahead of us — unlike rear events (single closest
+# threat), evasion needs to know about obstacles across ALL lanes at once
+# (to pick a clear neighboring lane), so this returns a list, sorted
+# closest-first, mirroring detect_tokens's return shape.
+# ---------------------------------------------------------
+def detect_front_obstacles(frame, cfg=CONFIG):
+    """
+    Detects cars/obstacles ahead in the front camera via the same HSV +
+    car-shaped-contour filter as detect_rear_events, applied to
+    cfg['front_obstacle_roi'].
+
+    Returns a list of ObstacleDetection sorted closest-first (largest
+    distance_estimate first), or [] if frame is None or nothing qualifies.
+    """
+    if frame is None:
+        return []
+
+    small = _prep_frame(frame, cfg)
+    roi_bgr = _crop_roi(small, cfg['front_obstacle_roi'])
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    roi_h, roi_w = roi_bgr.shape[:2]
+
+    candidates = _find_car_contours(hsv, roi_h, roi_w, cfg)
+    detections = [
+        ObstacleDetection(
+            faster_car=not is_police, police_car=is_police,
+            lane=lane, distance_estimate=dist, cx=cx, cy=cy, area=area,
+        )
+        for area, is_police, cx, cy, lane, dist in candidates
+    ]
+    detections.sort(key=lambda d: d.distance_estimate, reverse=True)
+    return detections
 
 
 # ---------------------------------------------------------
@@ -410,6 +467,10 @@ if __name__ == '__main__':
     print(f"Brightness (V mean): {measure_brightness(front):.1f}")
     for t in detect_tokens(front):
         print(f"  Token: color={t.color} lane={t.lane} dist={t.distance_estimate:.1f}")
+
+    for o in detect_front_obstacles(front):
+        print(f"  Front obstacle: faster_car={o.faster_car} police_car={o.police_car} "
+              f"lane={o.lane} dist={o.distance_estimate:.1f}")
 
     if len(sys.argv) > 2:
         back = cv2.imread(sys.argv[2])
