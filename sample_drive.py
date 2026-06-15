@@ -162,23 +162,36 @@ def compute_brightness(frame):
     return float(np.mean(frame))
 
 
+_lane_ema = {'left': None, 'right': None}  # temporal smoothing of lane positions
+
 def detect_lane_centers(frame):
     h, w = frame.shape[:2]
-    # Road surface only — skip sky (top 35%) and player car (bottom 18%)
     roi = frame[int(h * 0.35):int(h * 0.82), :]
-    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    # White lane dividers: low saturation, high brightness
+    # Blur before HSV conversion to reduce noise speckles
+    roi_blur = cv2.GaussianBlur(roi, (5, 5), 0)
+    hsv_roi = cv2.cvtColor(roi_blur, cv2.COLOR_BGR2HSV)
     white_mask = cv2.inRange(hsv_roi,
                              np.array([0,   0, 190]),
                              np.array([180, 45, 255]))
-    col_sums = np.sum(white_mask, axis=0)
+    # Morphological opening removes isolated noise pixels
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
+    col_sums = np.sum(white_mask, axis=0).astype(np.float32)
+    # Smooth column sums so the dominant lane band wins over isolated spikes
+    col_sums = np.convolve(col_sums, np.ones(15) / 15, mode='same')
     mid = w // 2
     left_half  = col_sums[:mid]
     right_half = col_sums[mid:]
-    # When no white pixels found, argmax returns 0 on both halves → mid_x = w/4 → false LEFT steer.
-    # Fall back to the frame edges so mid_x = w/2 → zero steering.
-    left_x  = int(np.argmax(left_half))       if np.max(left_half)  > 0 else 0
-    right_x = int(np.argmax(right_half)) + mid if np.max(right_half) > 0 else w
+    raw_left  = int(np.argmax(left_half))       if np.max(left_half)  > 50 else None
+    raw_right = int(np.argmax(right_half)) + mid if np.max(right_half) > 50 else None
+    # EMA smoothing across frames; fall back to frame edges when no lane found
+    alpha = 0.4
+    if raw_left is not None:
+        _lane_ema['left'] = raw_left if _lane_ema['left'] is None else int(alpha * raw_left + (1 - alpha) * _lane_ema['left'])
+    if raw_right is not None:
+        _lane_ema['right'] = raw_right if _lane_ema['right'] is None else int(alpha * raw_right + (1 - alpha) * _lane_ema['right'])
+    left_x  = _lane_ema['left']  if _lane_ema['left']  is not None else 0
+    right_x = _lane_ema['right'] if _lane_ema['right'] is not None else w
     mid_x   = (left_x + right_x) // 2
     return left_x, right_x, mid_x
 
@@ -198,105 +211,137 @@ def detect_tokens(frame):
     exclude[:,                int(w * 0.85):]               = 255  # right curb / road edge
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     results = {}
     for color, (lo, hi) in TOKEN_HSV.items():
         mask = cv2.inRange(hsv, np.array(lo), np.array(hi))
         if color == 'red':
             mask |= cv2.inRange(hsv, np.array([170, 80, 150]),
                                      np.array([180, 195, 255]))
-        mask[exclude > 0] = 0  # apply exclusion zones
+        mask[exclude > 0] = 0
+        # Morphological opening: removes noise specks, keeps solid blobs
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, morph_kernel)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
         blobs = []
         for c in contours:
             area = cv2.contourArea(c)
-            if area > 30:
-                M = cv2.moments(c)
-                if M['m00'] > 0:
-                    cx = int(M['m10'] / M['m00'])
-                    cy = int(M['m01'] / M['m00'])
-                    blobs.append((cx, cy, int(np.sqrt(area / np.pi))))
+            if area < 80:  # raised threshold: ignore tiny noise
+                continue
+            # Circularity filter — tokens are coin-shaped; elongated road markings are not
+            perimeter = cv2.arcLength(c, True)
+            if perimeter > 0 and (4 * np.pi * area / perimeter ** 2) < 0.25:
+                continue
+            M = cv2.moments(c)
+            if M['m00'] > 0:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+                blobs.append((cx, cy, int(np.sqrt(area / np.pi))))
         results[color] = blobs
     return results
 
 
+_rear_history = ['clear'] * 5  # rolling vote buffer — smooths single-frame false detections
+_rear_idx = [0]
+
 def detect_rear_event(back_frame):
     if back_frame is None:
-        return 'clear'
-    bh, bw = back_frame.shape[:2]
-    # Only inspect the center road region — skip sky (top 30%) to avoid blue-sky false positives
-    roi = back_frame[int(bh * 0.30):int(bh * 0.85), int(bw * 0.15):int(bw * 0.85)]
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    blue = cv2.inRange(hsv, np.array([100, 150, 150]), np.array([130, 255, 255]))
-    red1 = cv2.inRange(hsv, np.array([0,   150, 150]), np.array([10,  255, 255]))
-    red2 = cv2.inRange(hsv, np.array([170, 150, 150]), np.array([180, 255, 255]))
-    red  = cv2.bitwise_or(red1, red2)
-    b_contours, _ = cv2.findContours(blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    r_contours, _ = cv2.findContours(red,  cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    max_blue_area = max((cv2.contourArea(c) for c in b_contours), default=0)
-    max_red_area  = max((cv2.contourArea(c) for c in r_contours), default=0)
-    if max_blue_area > 200 and max_red_area > 200:
-        return 'police'
-    # Car: large contiguous object in the ROI that is NOT a token color.
-    # Yellow, green, and red in the back camera are tokens — exclude them.
-    yellow_mask = cv2.inRange(hsv, np.array([15,  80,  80]), np.array([40,  255, 255]))
-    green_mask  = cv2.inRange(hsv, np.array([40,  80,  80]), np.array([80,  255, 255]))
-    red_t1      = cv2.inRange(hsv, np.array([0,   80,  80]), np.array([10,  255, 255]))
-    red_t2      = cv2.inRange(hsv, np.array([170, 80,  80]), np.array([180, 255, 255]))
-    token_mask  = yellow_mask | green_mask | red_t1 | red_t2
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY)
-    thresh[token_mask > 0] = 0  # strip token-coloured pixels before contour check
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if any(cv2.contourArea(c) > 1000 for c in contours):
-        return 'car'
-    return 'clear'
+        raw = 'clear'
+    else:
+        bh, bw = back_frame.shape[:2]
+        roi = back_frame[int(bh * 0.30):int(bh * 0.85), int(bw * 0.15):int(bw * 0.85)]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        blue = cv2.inRange(hsv, np.array([100, 150, 150]), np.array([130, 255, 255]))
+        red1 = cv2.inRange(hsv, np.array([0,   150, 150]), np.array([10,  255, 255]))
+        red2 = cv2.inRange(hsv, np.array([170, 150, 150]), np.array([180, 255, 255]))
+        red  = cv2.bitwise_or(red1, red2)
+        b_contours, _ = cv2.findContours(blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        r_contours, _ = cv2.findContours(red,  cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        max_blue_area = max((cv2.contourArea(c) for c in b_contours), default=0)
+        max_red_area  = max((cv2.contourArea(c) for c in r_contours), default=0)
+        # Relaxed from 200→150 each: police lights alternate, so one colour sometimes dominates
+        if max_blue_area > 150 and max_red_area > 150:
+            raw = 'police'
+        else:
+            yellow_mask = cv2.inRange(hsv, np.array([15,  80,  80]), np.array([40,  255, 255]))
+            green_mask  = cv2.inRange(hsv, np.array([40,  80,  80]), np.array([80,  255, 255]))
+            red_t1      = cv2.inRange(hsv, np.array([0,   80,  80]), np.array([10,  255, 255]))
+            red_t2      = cv2.inRange(hsv, np.array([170, 80,  80]), np.array([180, 255, 255]))
+            token_mask  = yellow_mask | green_mask | red_t1 | red_t2
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            # Otsu picks the threshold automatically — more robust than fixed 100 under varying light
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            thresh[token_mask > 0] = 0
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            raw = 'car' if any(cv2.contourArea(c) > 800 for c in contours) else 'clear'
 
+    # Majority vote over last 5 frames — eliminates single-frame noise
+    _rear_history[_rear_idx[0] % len(_rear_history)] = raw
+    _rear_idx[0] += 1
+    return max(set(_rear_history), key=_rear_history.count)
+
+
+_mode_state = {'mode': 'NORMAL', 'count': 0}
+_MODE_CONFIRM = 3  # frames a candidate mode must persist before we commit to it
 
 def decide_action(brightness, tokens, rear_event, mid_x, frame_w, frame_h):
-    mode = 'NORMAL'
-    if   rear_event == 'police': mode = 'POLICE'
-    elif rear_event == 'car':    mode = 'FAST_CAR'
-    elif brightness < BRIGHTNESS_THRESHOLD: mode = 'DARK'
+    # --- Mode with hysteresis: ignore single-frame flickers ---
+    candidate = 'NORMAL'
+    if   rear_event == 'police':            candidate = 'POLICE'
+    elif rear_event == 'car':               candidate = 'FAST_CAR'
+    elif brightness < BRIGHTNESS_THRESHOLD: candidate = 'DARK'
+
+    if candidate == _mode_state['mode']:
+        _mode_state['count'] = min(_mode_state['count'] + 1, _MODE_CONFIRM)
+    else:
+        _mode_state['count'] -= 1
+        if _mode_state['count'] <= 0:
+            _mode_state['mode']  = candidate
+            _mode_state['count'] = 1
+    mode = _mode_state['mode']
 
     steering = compute_steering(mid_x, frame_w)
     accel    = 1.0
 
+    greens  = tokens.get('green',  [])
+    dangers = tokens.get('yellow', []) + tokens.get('red', [])
+    # Only react to dangers in the bottom 45 % of the frame (close range)
+    ahead   = [t for t in dangers if t[1] > frame_h * 0.55]
+
+    def _dodge(token):
+        """Proportional dodge: scale push strength by how close the token is."""
+        side      = 1.0 if token[0] < frame_w // 2 else -1.0   # +1 = dodge right, -1 = dodge left
+        proximity = (token[1] - frame_h * 0.55) / (frame_h * 0.45 + 1e-6)  # 0..1
+        return float(np.clip(side * (0.5 + 0.5 * proximity), -1.0, 1.0))
+
     if mode == 'POLICE':
-        greens  = tokens.get('green',  [])
-        dangers = tokens.get('yellow', []) + tokens.get('red', [])
         if greens:
             target   = max(greens, key=lambda t: t[1])
             steering = compute_steering(target[0], frame_w)
-        ahead = [t for t in dangers if t[1] > frame_h * 0.55]
-        if ahead:
-            nearest_d      = max(ahead, key=lambda t: t[1])
-            nearest_green_y = max((g[1] for g in greens), default=0)
-            if nearest_d[1] >= nearest_green_y:
-                steering = 1.0 if nearest_d[0] < frame_w // 2 else -1.0
-
-    elif mode == 'FAST_CAR':
-        steering = -1.0 if steering >= 0 else 1.0
-
-    elif mode == 'DARK':
-        accel = 0.5
-
-    elif mode == 'NORMAL':
-        greens  = tokens.get('green',  [])
-        dangers = tokens.get('yellow', []) + tokens.get('red', [])
-        if greens:
-            target   = max(greens, key=lambda t: t[1])
-            steering = compute_steering(target[0], frame_w)
-        # Only avoid dangers in bottom 45 % of frame (t[1] > 0.55*h = close range).
-        # Only override green seeking if the danger is AT LEAST as close as the nearest green —
-        # prevents the car from steering away from a nearby green to avoid a farther red.
-        ahead = [t for t in dangers if t[1] > frame_h * 0.55]
         if ahead:
             nearest_d       = max(ahead, key=lambda t: t[1])
             nearest_green_y = max((g[1] for g in greens), default=0)
             if nearest_d[1] >= nearest_green_y:
-                steering = 1.0 if nearest_d[0] < frame_w // 2 else -1.0
-        # Dynamic acceleration: full speed when clear, ease off while dodging
+                steering = _dodge(nearest_d)
+        accel = 1.0
+
+    elif mode == 'FAST_CAR':
+        # Move to the opposite side of the lane centre proportionally
+        steering = float(np.clip(-compute_steering(mid_x, frame_w) * 1.5, -1.0, 1.0))
+        accel    = 1.0
+
+    elif mode == 'DARK':
+        accel = 0.5
+
+    else:  # NORMAL
+        if greens:
+            target   = max(greens, key=lambda t: t[1])
+            steering = compute_steering(target[0], frame_w)
+        if ahead:
+            nearest_d       = max(ahead, key=lambda t: t[1])
+            nearest_green_y = max((g[1] for g in greens), default=0)
+            if nearest_d[1] >= nearest_green_y:
+                steering = _dodge(nearest_d)
         accel = 0.85 if ahead else 1.0
 
     return steering, accel, mode
@@ -575,17 +620,16 @@ if __name__ == '__main__':
     t_back_camera  = RTTask("ReadBackCamera",  period=0.005, priority=TaskPriority.HIGH,   execute_func=read_back_camera_task)
     t_processing   = RTTask("Processing",      period=0.030, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls     = RTTask("SendControls",    period=0.010, priority=TaskPriority.HIGH,   execute_func=send_controls_task)
-    t_display      = RTTask("Display",         period=0.050, priority=TaskPriority.LOW,    execute_func=display_task)
 
     t_front_camera.start()
     t_back_camera.start()
     t_processing.start()
     t_controls.start()
-    t_display.start()
 
     try:
         while is_running:
-            time.sleep(1)
+            display_task()   # cv2.imshow must run on the main thread
+            time.sleep(0.05)
     except KeyboardInterrupt:
         print("\nKeyboard Interrupt detected. Stopping system...")
         is_running = False
@@ -594,7 +638,6 @@ if __name__ == '__main__':
     t_back_camera.join()
     t_processing.join()
     t_controls.join()
-    t_display.join()
 
     if front_camera_sock:
         front_camera_sock.close()
