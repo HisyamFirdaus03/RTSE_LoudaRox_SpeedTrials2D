@@ -663,56 +663,66 @@ def processing_task():
             steer = steer_toward(t[0], w, t[1], h)
 
         else:
-            # --- Lane-scoring decision ---
-            # Every token in every lane contributes to that lane's score.
-            # Proximity weight: tokens further down the frame (closer to the car)
-            # have more influence than distant ones.
-            #   Green  → +10 × (1 + proximity)   attract
-            #   Red    → -20 × (1 + proximity)   repel hard
-            #   Yellow → -10 × (1 + proximity)   repel soft
-            edge_px = int(w * ROAD_EDGE_MARGIN)
-            lane_px = (w - 2 * edge_px) / NUM_LANES
-            scores  = [0.0] * NUM_LANES
-
-            for cx, cy, _ in tokens['green']:
-                scores[get_lane(cx, w)] += 10.0 * (1.0 + cy / h)
-            for cx, cy, _ in tokens['red']:
-                scores[get_lane(cx, w)] -= 20.0 * (1.0 + cy / h)
-            for cx, cy, _ in tokens['yellow']:
-                scores[get_lane(cx, w)] -= 10.0 * (1.0 + cy / h)
-
-            best_lane  = max(range(NUM_LANES), key=lambda l: scores[l])
-            best_score = scores[best_lane]
-            best_cx    = int(edge_px + (best_lane + 0.5) * lane_px)
-
-            if all(s == 0.0 for s in scores):
-                # No tokens anywhere — use committed target or drift to centre
-                if gs['target_x'] is not None and now2 < gs['target_commit_end']:
-                    steer = steer_toward(gs['target_x'], w)
-                else:
-                    last_steer = shared_data.get('steering_input', 0.0)
-                    steer = float(np.clip(-last_steer * 0.3, -0.3, 0.3))
-
-            elif best_score < 0.0:
-                # Every lane has at least one bad token — flee the worst lane
-                worst_lane = min(range(NUM_LANES), key=lambda l: scores[l])
-                worst_cx   = int(edge_px + (worst_lane + 0.5) * lane_px)
-                steer = steer_away(worst_cx, w)
+            # --- Imminent red token: direct dodge before lane scoring ---
+            # If any red token is in the bottom 45 % of the frame it is close
+            # enough to require an immediate steer-away rather than waiting for
+            # the scoring system to react.
+            imminent_reds = [t for t in tokens['red'] if t[1] > h * 0.55]
+            if imminent_reds:
+                t = max(imminent_reds, key=lambda b: b[1])   # closest red
+                steer = steer_away(t[0], w, t[1], h)
 
             else:
-                # Steer toward the highest-scoring lane
-                if best_score > 0.0:
-                    gs['target_x']          = best_cx
-                    gs['target_commit_end'] = now2 + 0.5
-                err = (best_cx - w / 2) / (w / 2)
-                if abs(err) < SAME_LANE_ERR:
-                    steer = 0.0                              # already in best lane
-                elif abs(err) >= FAR_LANE_ERR:
-                    gs['lane_switch_dir'] = float(np.sign(err))
-                    gs['lane_switch_end'] = now2 + MULTI_LANE_HOLD
-                    steer = gs['lane_switch_dir']
+                # --- Lane-scoring decision ---
+                # Every token in every lane contributes to that lane's score.
+                # Proximity weight: tokens further down the frame (closer to the car)
+                # have more influence than distant ones.
+                #   Green  → +10 × (1 + proximity)   attract
+                #   Red    → -20 × (1 + proximity)   repel hard
+                #   Yellow → -10 × (1 + proximity)   repel soft
+                edge_px = int(w * ROAD_EDGE_MARGIN)
+                lane_px = (w - 2 * edge_px) / NUM_LANES
+                scores  = [0.0] * NUM_LANES
+
+                for cx, cy, _ in tokens['green']:
+                    scores[get_lane(cx, w)] += 10.0 * (1.0 + cy / h)
+                for cx, cy, _ in tokens['red']:
+                    scores[get_lane(cx, w)] -= 20.0 * (1.0 + cy / h)
+                for cx, cy, _ in tokens['yellow']:
+                    scores[get_lane(cx, w)] -= 10.0 * (1.0 + cy / h)
+
+                best_lane  = max(range(NUM_LANES), key=lambda l: scores[l])
+                best_score = scores[best_lane]
+                best_cx    = int(edge_px + (best_lane + 0.5) * lane_px)
+
+                if all(s == 0.0 for s in scores):
+                    # No tokens anywhere — use committed target or drift to centre
+                    if gs['target_x'] is not None and now2 < gs['target_commit_end']:
+                        steer = steer_toward(gs['target_x'], w)
+                    else:
+                        last_steer = shared_data.get('steering_input', 0.0)
+                        steer = float(np.clip(-last_steer * 0.3, -0.3, 0.3))
+
+                elif best_score < 0.0:
+                    # Every lane has at least one bad token — flee the worst lane
+                    worst_lane = min(range(NUM_LANES), key=lambda l: scores[l])
+                    worst_cx   = int(edge_px + (worst_lane + 0.5) * lane_px)
+                    steer = steer_away(worst_cx, w)
+
                 else:
-                    steer = steer_toward(best_cx, w)
+                    # Steer toward the highest-scoring lane
+                    if best_score > 0.0:
+                        gs['target_x']          = best_cx
+                        gs['target_commit_end'] = now2 + 0.5
+                    err = (best_cx - w / 2) / (w / 2)
+                    if abs(err) < SAME_LANE_ERR:
+                        steer = 0.0                              # already in best lane
+                    elif abs(err) >= FAR_LANE_ERR:
+                        gs['lane_switch_dir'] = float(np.sign(err))
+                        gs['lane_switch_end'] = now2 + MULTI_LANE_HOLD
+                        steer = gs['lane_switch_dir']
+                    else:
+                        steer = steer_toward(best_cx, w)
 
     # Update shared_data OUTSIDE state_lock to avoid lock-order deadlock
     # (send_controls_task acquires data_lock then state_lock — opposite order)
