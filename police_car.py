@@ -16,18 +16,29 @@ from agent_policy import (
 # =========================================================================
 PCFG = {
     # ---- Police-car detection (RED + BLUE together) --------------------
-    # The cop is the only thing on screen that is red AND blue at once: the sky
-    # is blue-only, red tokens and the red roadside are red-only. So we detect
-    # where blue and red sit close together -- that overlap is the cop.
-    "blue": [((100, 80, 60), (130, 255, 255))],
-    # px each colour mask is grown before intersecting, so the interleaved blue
-    # livery and red body merge into one "both" region. Bigger = more forgiving
-    # of gaps between the two colours (but risks bridging unrelated blobs).
-    "cop_dilate": 15,
-    # The overlap (both-colour) region is car-sized but smaller than the whole
-    # car, so this gate is lower than a full-car gate. Raise if scenery triggers,
-    # lower if the cop is missed. Fraction of W*H.
-    "police_min_area_frac": 0.004,
+    # The cop sprite is a compact car that is strongly RED and strongly BLUE,
+    # side by side. Nothing else on screen is both at once: the sky is blue-only,
+    # red tokens and the red roadside are red-only. So we detect ONE connected
+    # blob that contains BOTH colours. This is size-robust (works for a small or
+    # distant sprite), unlike requiring a large colour-overlap area.
+    # Blue band kept WIDE (navy -> royal -> light blue) with modest S/V floors.
+    # Calibrate against the live "Police Masks" window (set debug=True).
+    "blue": [((90, 60, 50), (135, 255, 255))],
+    # px the blue|red union is closed by, so the red half and blue half merge
+    # into ONE connected component even with a seam/gap between them.
+    "cop_dilate": 11,
+    # A blob must hold at least this much blue AND this much red to be the cop
+    # (rejects a lone stray pixel of the other colour). Fraction of W*H each.
+    "cop_min_color_frac": 0.00015,
+    # Minimum size of the whole red+blue blob. Low so even a distant sprite still
+    # qualifies; raise if scenery false-triggers. Fraction of W*H.
+    "police_min_area_frac": 0.0006,
+    # Vertical search band for the cop (fractions of H): below the sky, above the
+    # player's own red+blue car at the very bottom. Wider than the token ROI so a
+    # cop anywhere across the road is seen; the red+blue requirement keeps scenery
+    # out, so the narrow trapezoid isn't needed here.
+    "cop_search_top_frac": 0.28,
+    "cop_search_bot_frac": 0.80,
 
     # ---- Steering toward the red token --------------------------------
     "steer_gain":   2.2,    # P-gain on normalized horizontal error (matches brain)
@@ -80,6 +91,8 @@ class PoliceCarController:
         self.cop_box = None        # (x, y, w, h) bounding box, or None
         self._prev_steer = 0.0
         self._first_seen_t = None  # timestamp of first sighting (telemetry only)
+        self._dbg_blue = None      # last blue mask (diagnostic window)
+        self._dbg_red = None       # last red mask (diagnostic window)
 
     # -- main entry ------------------------------------------------------
     def apply(self, front_frame, steering, acceleration):
@@ -99,8 +112,8 @@ class PoliceCarController:
         cv2.fillPoly(roi_mask, [_roi_polygon(w, h)], 255)
         hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
 
-        # --- 1. Detect the cop via its blue livery ----------------------
-        self.cop_pos, self.cop_box = self._detect_cop(hsv, roi_mask, w, h)
+        # --- 1. Detect the cop (red+blue blob in the road search band) --
+        self.cop_pos, self.cop_box = self._detect_cop(hsv, w, h)
 
         if self.cop_pos is None:
             # Presence-driven revert: no cop -> policy stays in control.
@@ -156,37 +169,53 @@ class PoliceCarController:
         return steer, accel
 
     # -- detection helpers ----------------------------------------------
-    def _detect_cop(self, hsv, roi_mask, w, h):
-        """Return ((cx, cy), (x, y, bw, bh)) for the cop, detected as the largest
-        car-sized region where BLUE and RED sit close together. Returns
-        (None, None) if none qualifies. Requiring both colours rejects the
-        blue-only sky and red-only tokens/roadside."""
-        blue = cv2.bitwise_and(_build_color_mask(hsv, self.cfg["blue"]), roi_mask)
-        red = cv2.bitwise_and(_build_color_mask(hsv, CONFIG["red"]), roi_mask)
+    def _cop_search_mask(self, w, h):
+        """Wide horizontal band over the road (below sky, above the player's car)
+        used to look for the cop. Stored geometry, cheap to rebuild each frame."""
+        band = np.zeros((h, w), np.uint8)
+        y0 = int(self.cfg["cop_search_top_frac"] * h)
+        y1 = int(self.cfg["cop_search_bot_frac"] * h)
+        band[y0:y1, :] = 255
+        return band
 
-        # Grow each colour, then intersect: lights up only where blue and red are
-        # adjacent (the cop's interleaved livery + body). Sky has no red, tokens
-        # and the red shoulder have no blue -> they vanish here.
+    def _detect_cop(self, hsv, w, h):
+        """Return ((cx, cy), (x, y, bw, bh)) for the cop: the largest connected
+        blob inside the search band that contains BOTH enough blue AND enough red
+        px. Size-robust (no large-overlap requirement) so a small/distant sprite
+        still registers. Requiring both colours rejects blue-only sky and red-only
+        tokens/roadside. Returns (None, None) if nothing qualifies."""
+        band = self._cop_search_mask(w, h)
+        blue = cv2.bitwise_and(_build_color_mask(hsv, self.cfg["blue"]), band)
+        red = cv2.bitwise_and(_build_color_mask(hsv, CONFIG["red"]), band)
+
+        # Merge the red half and blue half into one component (close over the seam).
         k = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (self.cfg["cop_dilate"], self.cfg["cop_dilate"]))
-        both = cv2.bitwise_and(cv2.dilate(blue, k), cv2.dilate(red, k))
-        both = cv2.morphologyEx(both, cv2.MORPH_CLOSE, k)
+        combo = cv2.morphologyEx(cv2.bitwise_or(blue, red), cv2.MORPH_CLOSE, k)
 
-        cnts, _ = cv2.findContours(both, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Stash masks for the diagnostic window.
+        self._dbg_blue, self._dbg_red = blue, red
+
+        n, labels, stats, centroids = cv2.connectedComponentsWithStats(combo, 8)
         min_area = self.cfg["police_min_area_frac"] * (w * h)
+        min_color = self.cfg["cop_min_color_frac"] * (w * h)
         best, best_area = None, 0.0
-        for c in cnts:
-            area = cv2.contourArea(c)
+        for i in range(1, n):                       # 0 is background
+            area = stats[i, cv2.CC_STAT_AREA]
             if area < min_area or area <= best_area:
                 continue
-            best, best_area = c, area
+            comp = labels == i
+            if np.count_nonzero(blue[comp]) < min_color:
+                continue
+            if np.count_nonzero(red[comp]) < min_color:
+                continue
+            best, best_area = i, area
         if best is None:
             return None, None
-        x, y, bw, bh = cv2.boundingRect(best)
-        M = cv2.moments(best)
-        if M["m00"] == 0:
-            return None, None
-        return (M["m10"] / M["m00"], M["m01"] / M["m00"]), (x, y, bw, bh)
+        x = int(stats[best, cv2.CC_STAT_LEFT]); y = int(stats[best, cv2.CC_STAT_TOP])
+        bw = int(stats[best, cv2.CC_STAT_WIDTH]); bh = int(stats[best, cv2.CC_STAT_HEIGHT])
+        cx, cy = centroids[best]
+        return (float(cx), float(cy)), (x, y, bw, bh)
 
     def _road_region(self, hsv, roi_mask):
         """Grey-asphalt mask, dilated to cover on-road tokens, ANDed with the ROI
@@ -249,9 +278,23 @@ class PoliceCarController:
             remain = ""
             if self._first_seen_t is not None:
                 remain = f"  t~{max(0.0, self.cfg['police_duration'] - (time.time() - self._first_seen_t)):.1f}s"
+            # draw the cop search band so we can see where we look for the cop
+            y0 = int(self.cfg["cop_search_top_frac"] * h)
+            y1 = int(self.cfg["cop_search_bot_frac"] * h)
+            cv2.rectangle(vis, (0, y0), (w - 1, y1), (0, 200, 200), 1)
             cv2.putText(vis, f"POLICE:{mode}  steer={steer:+.2f}{remain}", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
             cv2.imshow("Police Debug", vis)
+
+            # --- Mask diagnostic: see EXACTLY what blue/red the cop produces.
+            # Blue mask tinted blue, red mask tinted red, over a dim frame. If the
+            # cop appears here without lighting up BOTH colours, widen PCFG["blue"]
+            # / CONFIG["red"] until it does.
+            if self._dbg_blue is not None and self._dbg_red is not None:
+                masks = cv2.addWeighted(frame, 0.35, np.zeros_like(frame), 0, 0)
+                masks[self._dbg_blue > 0] = (255, 0, 0)
+                masks[self._dbg_red > 0] = (0, 0, 255)
+                cv2.imshow("Police Masks (B=blue R=red)", masks)
             cv2.waitKey(1)
         except Exception:
             pass
