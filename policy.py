@@ -37,13 +37,6 @@ POLICY_CONFIG = {
     'rear_very_close_distance': 4000.0,
     'rear_close_streak_required': 5,     # consecutive close detections before triggering
 
-    # Front-obstacle thresholds — mirror the rear ones but for forward
-    # collision risk (the more urgent threat: ramming a car ahead).
-    # STILL NEEDS calibration against the live sim.
-    'front_obstacle_evade_distance': 3500.0,    # triggers evasive lane change
-    'front_obstacle_brake_distance': 5000.0,    # triggers braking fallback when boxed in
-    'front_obstacle_brake_acceleration': 0.0,   # coast (not reverse) fallback
-
     # --- Discrete lane-change tap parameters ---
     # Per the lab PDF, steering is TAPPED (brief pulse to +-1.0, then back to
     # 0.0) to shift exactly one lane — not held proportionally. The actual
@@ -224,50 +217,6 @@ def _request_lane_change(state, direction, now):
     state.lane_change_request = direction
 
 
-def _handle_front_obstacles(state, obstacles, now):
-    """
-    Returns (direction: 'left'|'right'|None, should_brake: bool).
-
-    If an obstacle in state.current_lane is at or beyond
-    front_obstacle_evade_distance, tries to step into whichever neighboring
-    lane (current_lane -1 then +1, preferring left) doesn't itself have an
-    obstacle at or beyond that same threshold. If both neighbors are blocked
-    (or off-road) or current_lane is unknown, no direction is returned;
-    should_brake is True only in that boxed-in case, and only if the
-    obstacle ahead is close enough to cross front_obstacle_brake_distance.
-
-    Like _handle_rear_events/_handle_tokens, this does not call
-    _request_lane_change directly — decide() owns request-issuing so it can
-    apply priority ordering across all evasion sources.
-    """
-    if not obstacles or state.current_lane is None:
-        return None, False
-
-    # Closest obstacle per lane (obstacles is sorted closest-first already).
-    closest_by_lane = {}
-    for obs in obstacles:
-        if obs.lane not in closest_by_lane:
-            closest_by_lane[obs.lane] = obs
-
-    ahead = closest_by_lane.get(state.current_lane)
-    if ahead is None or ahead.distance_estimate < POLICY_CONFIG['front_obstacle_evade_distance']:
-        return None, False
-
-    candidates = []
-    if state.current_lane > 0:
-        candidates.append(state.current_lane - 1)
-    if state.current_lane < state.num_lanes - 1:
-        candidates.append(state.current_lane + 1)
-
-    for target in candidates:
-        blocker = closest_by_lane.get(target)
-        if blocker is None or blocker.distance_estimate < POLICY_CONFIG['front_obstacle_evade_distance']:
-            return _direction_to(state, target), False
-
-    should_brake = ahead.distance_estimate >= POLICY_CONFIG['front_obstacle_brake_distance']
-    return None, should_brake
-
-
 def _handle_rear_events(state, rear, now):
     """
     Returns a discrete evasion direction ('left'|'right'|None). Mutates state
@@ -365,8 +314,7 @@ def _apply_collection_effect(state, color, now):
 def decide(front_detections, rear_detection, brightness, state, now):
     """
     front_detections: {'lane_index': int|None, 'lane_confidence': float,
-                       'lane_offset': float, 'tokens': list[TokenDetection],
-                       'obstacles': list[ObstacleDetection]}
+                       'lane_offset': float, 'tokens': list[TokenDetection]}
     rear_detection: RearDetection or None
     brightness: float (mean V channel, 0-255)
     state: AgentState — mutated in place
@@ -384,24 +332,16 @@ def decide(front_detections, rear_detection, brightness, state, now):
     _update_current_lane(state, front_detections.get('lane_index'),
                          front_detections.get('lane_confidence', 0.0), now)
 
-    # Front-obstacle evasion takes the HIGHEST priority — ramming a car
-    # directly ahead at full throttle is the most urgent threat, more so
-    # than being rear-ended or missing a token.
-    obstacles = front_detections.get('obstacles', [])
-    front_direction, should_brake = _handle_front_obstacles(state, obstacles, now)
-    _request_lane_change(state, front_direction, now)
-
-    # Rear-event evasion only claims the lane-change slot if front evasion
-    # didn't already use it this cycle. Mirrors the existing
-    # must_collect_red priority pattern. Only one lane-change request can be
-    # in flight, so if evasion claims it, token-seeking waits for next cycle.
+    # Rear-event evasion takes strict priority over token-seeking — mirrors
+    # the existing must_collect_red priority pattern. Only one lane-change
+    # request can be in flight, so if evasion claims it this cycle,
+    # token-seeking simply waits for the next opportunity.
     rear_direction = _handle_rear_events(state, rear_detection, now)
-    if front_direction is None:
-        _request_lane_change(state, rear_direction, now)
+    _request_lane_change(state, rear_direction, now)
 
     tokens = [] if state.tokens_invisible_until else front_detections.get('tokens', [])
     token_direction, collected_color = _handle_tokens(state, tokens, now)
-    if front_direction is None and rear_direction is None:
+    if rear_direction is None:
         _request_lane_change(state, token_direction, now)
 
     if collected_color is not None:
@@ -411,13 +351,5 @@ def decide(front_detections, rear_detection, brightness, state, now):
 
     acceleration = state.effective_speed_multiplier(now)
     acceleration = max(POLICY_CONFIG['min_acceleration'], min(1.0, acceleration))
-
-    # Braking fallback: when boxed in with an obstacle bearing down and no
-    # evasion lane available, override the normal acceleration entirely —
-    # this is a deliberate bypass of min_acceleration (whose purpose is to
-    # avoid crawling to a stop while chasing tokens, not to prevent slowing
-    # down ahead of an imminent collision).
-    if should_brake:
-        acceleration = POLICY_CONFIG['front_obstacle_brake_acceleration']
 
     return acceleration
