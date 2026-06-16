@@ -714,15 +714,19 @@ def processing_task():
                 else:
                     steer = steer_toward(best_cx, w)
 
+    # Challenge 1 — Low Light recovery: send acceleration_input = -1.0 while dark
+    # so the game restores brightness. Normal throttle (1.0) the rest of the time.
+    accel = -1.0 if gs['low_brightness'] else 1.0
+
     # Update shared_data OUTSIDE state_lock to avoid lock-order deadlock
     # (send_controls_task acquires data_lock then state_lock — opposite order)
     with data_lock:
         shared_data['steering_input']     = steer
-        shared_data['acceleration_input'] = 1.0
+        shared_data['acceleration_input'] = accel
 
     # Buffer action for action-delay effect
     with buf_lock:
-        action_buffer.append((now2, steer, 1.0))
+        action_buffer.append((now2, steer, accel))
 
     draw_debug(front_frame, tokens, steer, gs)
 
@@ -731,7 +735,7 @@ def processing_task():
     if now2 - _last_print_time >= 1.0:
         _last_print_time = now2
         print("=" * 55)
-        print(f"[CAR]  steering={steer:+.3f}  acceleration=1.000")
+        print(f"[CAR]  steering={steer:+.3f}  acceleration={accel:+.3f}")
         print(f"[CAM]  front_frame={'OK' if raw_front is not None else 'NONE'}"
               f"  back_frame={'OK' if back_frame is not None else 'NONE'}")
         print(f"[SENS] brightness={brightness:.3f}  low_brightness={gs['low_brightness']}")
