@@ -8,10 +8,15 @@ import keyboard
 import select
 import ctypes
 from agent_policy import HeuristicPolicy
+from low_light import LowLightController
 
 # The swappable "brain". To upgrade later, change this one line to a trained
 # policy, e.g.  POLICY = LearnedPolicy("model.onnx")  -- nothing else changes.
 POLICY = HeuristicPolicy()
+
+# Challenge 1 (Low Light) handler -- a separate post-processing component that
+# overrides acceleration to recover the light when the screen goes dark.
+LOW_LIGHT = LowLightController()
 
 # ---------------------------------------------------------
 # Configuration
@@ -215,6 +220,8 @@ def processing_task():
     if front_frame is not None:
         # Run the swappable policy: BGR frame in -> (steering, acceleration) out.
         steering, acceleration = POLICY.act(front_frame, back_frame)
+        # Challenge 1 - Low Light: separate component overrides accel to recover the light.
+        steering, acceleration = LOW_LIGHT.apply(front_frame, steering, acceleration)
         with data_lock:
             shared_data['steering_input'] = steering
             shared_data['acceleration_input'] = acceleration
