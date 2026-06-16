@@ -15,14 +15,19 @@ from agent_policy import (
 # CONFIG -- tune on real frames (HSV is OpenCV's: H 0-179, S/V 0-255)
 # =========================================================================
 PCFG = {
-    # ---- Police-car detection (the blue livery / lightbar) -------------
-    # The cop's blue is the one cue that separates it from red tokens and the
-    # red player car. Wide-ish band with S/V floors to ignore dim/grey scenery.
+    # ---- Police-car detection (RED + BLUE together) --------------------
+    # The cop is the only thing on screen that is red AND blue at once: the sky
+    # is blue-only, red tokens and the red roadside are red-only. So we detect
+    # where blue and red sit close together -- that overlap is the cop.
     "blue": [((100, 80, 60), (130, 255, 255))],
-    # A car is much bigger than a token. This area gate (fraction of W*H) is the
-    # main false-trigger guard: raise it if blue scenery triggers, lower it if
-    # the cop is missed.
-    "police_min_area_frac": 0.010,
+    # px each colour mask is grown before intersecting, so the interleaved blue
+    # livery and red body merge into one "both" region. Bigger = more forgiving
+    # of gaps between the two colours (but risks bridging unrelated blobs).
+    "cop_dilate": 15,
+    # The overlap (both-colour) region is car-sized but smaller than the whole
+    # car, so this gate is lower than a full-car gate. Raise if scenery triggers,
+    # lower if the cop is missed. Fraction of W*H.
+    "police_min_area_frac": 0.004,
 
     # ---- Steering toward the red token --------------------------------
     "steer_gain":   2.2,    # P-gain on normalized horizontal error (matches brain)
@@ -39,7 +44,15 @@ PCFG = {
     "accel_seek":   0.85,   # forward throttle while hunting the red token
     "accel_dodge":  0.40,   # ease off so a swerve around the cop actually lands
 
-    # ---- Red-token detection (reuse the brain's tuned settings) --------
+    # ---- Red-token detection -------------------------------------------
+    # The red token is a PALE, glossy salmon orb (washed-out low-saturation
+    # centre, bright/high value) -- not the cop's solid deep red. Here red is
+    # the GOAL we must not miss, so this range is MORE LENIENT than the brain's
+    # hazard range (lower S-floor to catch the pale token; higher V-floor since
+    # the orb is bright, which keeps dull reddish clutter out). The road-surface
+    # gate + circularity still reject the red roadside, so leniency is safe.
+    "token_red": [((0, 28, 90),   (12, 255, 255)),    # pale/salmon red
+                  ((164, 28, 90), (179, 255, 255))],   # hue wrap-around
     "min_token_area_frac": CONFIG["min_token_area_frac"],
     "min_circularity":     CONFIG["min_circularity"],
 
@@ -144,12 +157,22 @@ class PoliceCarController:
 
     # -- detection helpers ----------------------------------------------
     def _detect_cop(self, hsv, roi_mask, w, h):
-        """Return ((cx, cy), (x, y, bw, bh)) for the largest car-sized blue blob
-        on the road, or (None, None) if none qualifies."""
+        """Return ((cx, cy), (x, y, bw, bh)) for the cop, detected as the largest
+        car-sized region where BLUE and RED sit close together. Returns
+        (None, None) if none qualifies. Requiring both colours rejects the
+        blue-only sky and red-only tokens/roadside."""
         blue = cv2.bitwise_and(_build_color_mask(hsv, self.cfg["blue"]), roi_mask)
-        blue = cv2.morphologyEx(blue, cv2.MORPH_CLOSE,
-                                np.ones((7, 7), np.uint8))   # merge livery + lightbar
-        cnts, _ = cv2.findContours(blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        red = cv2.bitwise_and(_build_color_mask(hsv, CONFIG["red"]), roi_mask)
+
+        # Grow each colour, then intersect: lights up only where blue and red are
+        # adjacent (the cop's interleaved livery + body). Sky has no red, tokens
+        # and the red shoulder have no blue -> they vanish here.
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (self.cfg["cop_dilate"], self.cfg["cop_dilate"]))
+        both = cv2.bitwise_and(cv2.dilate(blue, k), cv2.dilate(red, k))
+        both = cv2.morphologyEx(both, cv2.MORPH_CLOSE, k)
+
+        cnts, _ = cv2.findContours(both, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         min_area = self.cfg["police_min_area_frac"] * (w * h)
         best, best_area = None, 0.0
         for c in cnts:
@@ -165,10 +188,27 @@ class PoliceCarController:
             return None, None
         return (M["m10"] / M["m00"], M["m01"] / M["m00"]), (x, y, bw, bh)
 
+    def _road_region(self, hsv, roi_mask):
+        """Grey-asphalt mask, dilated to cover on-road tokens, ANDed with the ROI
+        -- mirrors HeuristicPolicy._road_region using the brain's CONFIG. Tokens
+        live on this grey surface; the RED road shoulder does not, so ANDing the
+        red mask with this drops the roadside while keeping real tokens."""
+        road = cv2.inRange(
+            hsv,
+            np.array((0, 0, CONFIG["road_val_min"]), np.uint8),
+            np.array((179, CONFIG["road_sat_max"], 255), np.uint8),
+        )
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (CONFIG["road_dilate"], CONFIG["road_dilate"]))
+        road = cv2.dilate(road, k)          # grow over tokens sitting on the road
+        return cv2.bitwise_and(road, roi_mask)
+
     def _red_token_mask(self, hsv, roi_mask, w, h):
-        """Red mask on the road, with the cop's bounding box zeroed out so the
-        cop's red body is never chased as a token."""
-        red = cv2.bitwise_and(_build_color_mask(hsv, CONFIG["red"]), roi_mask)
+        """Red tokens ON the grey road, with the cop's bounding box zeroed out so
+        the cop's red body is never chased as a token. Restricting to the road
+        surface (not just the ROI) is what excludes the red roadside/shoulder."""
+        road_region = self._road_region(hsv, roi_mask)
+        red = cv2.bitwise_and(_build_color_mask(hsv, self.cfg["token_red"]), road_region)
         red = _fill_blobs(red)
         if self.cop_box is not None:
             x, y, bw, bh = self.cop_box
