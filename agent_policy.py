@@ -84,7 +84,9 @@ CONFIG = {
                                 # without clipping the red -> skip it. Avoiding red
                                 # is prioritised over grabbing a risky green.
     "lane_cost":        0.3,    # penalty for steering far from center (lower = will take side lanes)
-    "yellow_weight":    0.8,    # yellow penalty relative to red (slightly softer)
+    "yellow_weight":    1.15,   # avoid yellow as hard as (or harder than) red: its
+                                # random debuff -- especially "lose colour vision" --
+                                # can blind a vision-based agent, so steer clear of it.
 
     # Hazard "panic" zone: a hazard this close AND near our center cuts throttle.
     "hazard_near_y_frac":  0.62,  # "close" = centroid below this fraction of H
