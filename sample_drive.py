@@ -9,6 +9,7 @@ import select
 import ctypes
 from agent_policy import HeuristicPolicy
 from low_light import LowLightController
+from police_car import PoliceCarController
 
 # The swappable "brain". To upgrade later, change this one line to a trained
 # policy, e.g.  POLICY = LearnedPolicy("model.onnx")  -- nothing else changes.
@@ -17,6 +18,10 @@ POLICY = HeuristicPolicy()
 # Challenge 1 (Low Light) handler -- a separate post-processing component that
 # overrides acceleration to recover the light when the screen goes dark.
 LOW_LIGHT = LowLightController()
+
+# Challenge 3 (Police Car) handler -- a separate post-processing component that
+# takes over steering to grab a red token and dodge the cop while it is on-screen.
+POLICE = PoliceCarController()
 
 # ---------------------------------------------------------
 # Configuration
@@ -222,6 +227,9 @@ def processing_task():
         steering, acceleration = POLICY.act(front_frame, back_frame)
         # Challenge 1 - Low Light: separate component overrides accel to recover the light.
         steering, acceleration = LOW_LIGHT.apply(front_frame, steering, acceleration)
+        # Challenge 3 - Police Car: while the cop is on-screen, take over to grab a
+        # red token and dodge the cop; otherwise pass the policy's output through.
+        steering, acceleration = POLICE.apply(front_frame, steering, acceleration)
         with data_lock:
             shared_data['steering_input'] = steering
             shared_data['acceleration_input'] = acceleration
