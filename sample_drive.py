@@ -10,6 +10,7 @@ import ctypes
 from agent_policy import HeuristicPolicy
 from low_light import LowLightController
 from police_car import PoliceCarController
+from chasing_car import ChasingCarController
 
 # The swappable "brain". To upgrade later, change this one line to a trained
 # policy, e.g.  POLICY = LearnedPolicy("model.onnx")  -- nothing else changes.
@@ -22,6 +23,10 @@ LOW_LIGHT = LowLightController()
 # Challenge 3 (Police Car) handler -- a separate post-processing component that
 # takes over steering to grab a red token and dodge the cop while it is on-screen.
 POLICE = PoliceCarController()
+
+# Challenge 2 (Chasing Car) handler -- watches the BACK camera and dodges the
+# teal chaser when it closes in (swerve aside + full throttle).
+CHASER = ChasingCarController()
 
 # ---------------------------------------------------------
 # Configuration
@@ -149,49 +154,57 @@ def setup_control_server():
 # Task Implementations (This is where you write your tasks)
 # ---------------------------------------------------------
 
+def recv_exact(sock, n):
+    """Receive EXACTLY n bytes from a TCP socket.
+
+    A single sock.recv(n) may return fewer than n bytes (TCP is a byte stream,
+    not message-framed). Reading the 4-byte length prefix with a bare recv(4)
+    can therefore under-read, yielding a wrong frame length, desyncing the
+    stream, and producing truncated JPEGs that decode with a black bottom half.
+    This loops until all n bytes arrive. Returns the bytes, or None if the
+    connection closed / timed out before n bytes were received.
+    """
+    buf = bytearray()
+    while len(buf) < n and is_running:
+        try:
+            packet = sock.recv(n - len(buf))
+        except socket.timeout:
+            return None
+        if not packet:           # peer closed the connection
+            return None
+        buf += packet
+    return bytes(buf) if len(buf) == n else None
+
+
 def read_single_camera(sock, window_name, data_key):
     #This function reads the latest frame from the camera socket and stores it in the shared data
     if sock is None:
         return
-        
+
     try:
         latest_frame_data = None
         sock.settimeout(None)
-        length_bytes = sock.recv(4)
+        length_bytes = recv_exact(sock, 4)
         if not length_bytes:
             return
-            
+
         image_length = int.from_bytes(length_bytes, 'little')
-        received_bytes = b''
-        while len(received_bytes) < image_length and is_running:
-            packet = sock.recv(image_length - len(received_bytes))
-            if not packet:
-                break
-            received_bytes += packet
-            
-        if len(received_bytes) == image_length:
-            latest_frame_data = received_bytes
-            
+        latest_frame_data = recv_exact(sock, image_length)
+
         while is_running:
             readable, _, _ = select.select([sock], [], [], 0.0)
             if not readable:
                 break
-                
+
             sock.settimeout(1.0)
-            length_bytes = sock.recv(4)
+            length_bytes = recv_exact(sock, 4)
             if not length_bytes:
                 return
             image_length = int.from_bytes(length_bytes, 'little')
-            received_bytes = b''
-            while len(received_bytes) < image_length and is_running:
-                packet = sock.recv(image_length - len(received_bytes))
-                if not packet:
-                    break
-                received_bytes += packet
-                
-            if len(received_bytes) == image_length:
-                latest_frame_data = received_bytes
-                
+            frame_data = recv_exact(sock, image_length)
+            if frame_data is not None:
+                latest_frame_data = frame_data   # keep only the most recent full frame
+
         if latest_frame_data is not None:
             np_arr = np.frombuffer(latest_frame_data, np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -230,6 +243,8 @@ def processing_task():
         # Challenge 3 - Police Car: while the cop is on-screen, take over to grab a
         # red token and dodge the cop; otherwise pass the policy's output through.
         steering, acceleration = POLICE.apply(front_frame, steering, acceleration)
+        # Challenge 2 - Chasing Car: runs LAST so its evasion overrides everything when active.
+        steering, acceleration = CHASER.apply(back_frame, steering, acceleration)
         with data_lock:
             shared_data['steering_input'] = steering
             shared_data['acceleration_input'] = acceleration
