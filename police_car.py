@@ -1,9 +1,28 @@
+"""
+police_car.py
+=============
+Police-car override for the driving agent.
+
+The level occasionally spawns a stationary police car. Hitting it is an instant
+game over, so while a cop is on screen this controller TAKES OVER from the main
+policy: it steers the car to grab the nearest red token while hard-avoiding the
+cop, then hands control straight back once the cop leaves the frame.
+
+Detection (see _detect_cop) keys off the cop's livery -- it is the only thing on
+screen that is strongly RED and strongly BLUE at once. The HSV bands for those
+two colours live in PCFG below and were measured from the real sprite with
+cop_hsv_sample.py; tune them live via the "Police Masks" window (debug=True).
+
+This module owns only cop colours. It borrows the brain's CONFIG for shared,
+non-cop concerns: road geometry (the ROI/asphalt mask) and token size/shape.
+"""
+
 import time
 import cv2
 import numpy as np
 
 from agent_policy import (
-    CONFIG,
+    CONFIG,            # brain config: reused only for road geometry + token size
     _build_color_mask,
     _fill_blobs,
     _detect_tokens,
@@ -21,9 +40,16 @@ PCFG = {
     # red tokens and the red roadside are red-only. So we detect ONE connected
     # blob that contains BOTH colours. This is size-robust (works for a small or
     # distant sprite), unlike requiring a large colour-overlap area.
-    # Blue band kept WIDE (navy -> royal -> light blue) with modest S/V floors.
+    # Both bands are OWNED HERE -- the cop detector does not borrow the brain's
+    # token-red (that band is tuned for pale salmon orbs, a different target).
+    # Anchored on the sampled sprite (cop_hsv_sample.py): blue H~125 / red H~0,
+    # both fully saturated, V from ~68 up. S/V floors are opened from the sprite
+    # values to survive the live JPEG feed + low-light dimming.
     # Calibrate against the live "Police Masks" window (set debug=True).
-    "blue": [((90, 60, 50), (135, 255, 255))],
+    "blue": [((108, 80, 45), (132, 255, 255))],
+    # The cop's red half/lights: pure red on the 0/179 hue seam, so two bands.
+    "red":  [((0, 80, 45),   (12, 255, 255)),     # red near hue 0
+             ((165, 80, 45), (179, 255, 255))],   # hue wrap-around
     # px the blue|red union is closed by, so the red half and blue half merge
     # into ONE connected component even with a seam/gap between them.
     "cop_dilate": 11,
@@ -78,9 +104,10 @@ def _clamp(x, lo=-1.0, hi=1.0):
 
 
 class PoliceCarController:
-    """Detects the stationary police car via its blue livery and, while it is on
-    screen, takes over steering to grab the nearest red token while hard-avoiding
-    the cop. When the cop is gone, the policy's output passes through unchanged."""
+    """Detects the stationary police car by its red+blue livery and, while it is
+    on screen, takes over steering to grab the nearest red token while hard-
+    avoiding the cop. When the cop is gone, the policy's output passes through
+    unchanged."""
 
     def __init__(self, config=None):
         self.cfg = dict(PCFG)
@@ -186,7 +213,7 @@ class PoliceCarController:
         tokens/roadside. Returns (None, None) if nothing qualifies."""
         band = self._cop_search_mask(w, h)
         blue = cv2.bitwise_and(_build_color_mask(hsv, self.cfg["blue"]), band)
-        red = cv2.bitwise_and(_build_color_mask(hsv, CONFIG["red"]), band)
+        red = cv2.bitwise_and(_build_color_mask(hsv, self.cfg["red"]), band)
 
         # Merge the red half and blue half into one component (close over the seam).
         k = cv2.getStructuringElement(
@@ -212,8 +239,11 @@ class PoliceCarController:
             best, best_area = i, area
         if best is None:
             return None, None
-        x = int(stats[best, cv2.CC_STAT_LEFT]); y = int(stats[best, cv2.CC_STAT_TOP])
-        bw = int(stats[best, cv2.CC_STAT_WIDTH]); bh = int(stats[best, cv2.CC_STAT_HEIGHT])
+
+        x = int(stats[best, cv2.CC_STAT_LEFT])
+        y = int(stats[best, cv2.CC_STAT_TOP])
+        bw = int(stats[best, cv2.CC_STAT_WIDTH])
+        bh = int(stats[best, cv2.CC_STAT_HEIGHT])
         cx, cy = centroids[best]
         return (float(cx), float(cy)), (x, y, bw, bh)
 
@@ -289,7 +319,7 @@ class PoliceCarController:
             # --- Mask diagnostic: see EXACTLY what blue/red the cop produces.
             # Blue mask tinted blue, red mask tinted red, over a dim frame. If the
             # cop appears here without lighting up BOTH colours, widen PCFG["blue"]
-            # / CONFIG["red"] until it does.
+            # / PCFG["red"] until it does.
             if self._dbg_blue is not None and self._dbg_red is not None:
                 masks = cv2.addWeighted(frame, 0.35, np.zeros_like(frame), 0, 0)
                 masks[self._dbg_blue > 0] = (255, 0, 0)
