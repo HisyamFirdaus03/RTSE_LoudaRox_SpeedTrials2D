@@ -7,6 +7,9 @@ import time
 import keyboard
 import select
 import ctypes
+import token_detection
+import navigation
+import low_light
 
 # ---------------------------------------------------------
 # Configuration
@@ -26,6 +29,13 @@ shared_data = {
 }
 data_lock = threading.Lock()
 is_running = True
+
+# Working resolution for the vision pipeline (token_detection / navigation / low_light)
+PROC_WIDTH, PROC_HEIGHT = 640, 480
+
+# Steering state carried frame-to-frame for smoothing, shared across the
+# low_light and navigation components so switching between them is continuous.
+_prev_steer = 0.0
 
 # ---------------------------------------------------------
 # Real-Time Scheduling Framework (Do not change this in your code)
@@ -203,25 +213,46 @@ def processing_task():
     #You can use libraries like OpenCV to process the image
     #There is no limtation to the complexity of the processing task, you can use any libraries you want
     #Remember to use the shared_data to get the latest frame
+    global _prev_steer
     with data_lock:
         front_frame = shared_data['latest_front_frame']
-    
-    if front_frame is not None:
-        # write your processing here
-        pass
+
+    if front_frame is None:
+        return
+
+    frame = front_frame
+    if frame.shape[1] != PROC_WIDTH or frame.shape[0] != PROC_HEIGHT:
+        frame = cv2.resize(frame, (PROC_WIDTH, PROC_HEIGHT))
+
+    # EV1 / Challenge 1 (Darkness) takes priority: tokens are unreadable while
+    # dark, so skip token detection entirely and hand off to low_light instead.
+    brightness = low_light.get_brightness(frame)
+    if low_light.is_dark(brightness):
+        steering, acceleration = low_light.handle(frame, brightness, _prev_steer)
+    else:
+        (green_blobs, red_blobs, yellow_blobs, roi_top, roi_bottom,
+         top_half_width_px, bottom_half_width_px) = token_detection.detect_tokens(frame)
+        steering, acceleration = navigation.compute_steering_and_throttle(
+            frame, green_blobs, red_blobs, yellow_blobs, roi_top, roi_bottom,
+            top_half_width_px, bottom_half_width_px)
+
+    _prev_steer = steering
+    with data_lock:
+        shared_data['steering_input'] = steering
+        shared_data['acceleration_input'] = acceleration
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
     global control_conn
     if control_conn is None:
         return
-    
+
     #these are the variables used to control the car
     #steering_input: -1.0 to 1.0 (left to right)
     #acceleration_input: -1.0 to 1.0 (reverse to forward)
-    #this example always accelerate forward
-    steering_input = 0.0
-    acceleration_input = 1.0
+    with data_lock:
+        steering_input = shared_data['steering_input']
+        acceleration_input = shared_data['acceleration_input']
 
     try:
         # Pack and send the control command
