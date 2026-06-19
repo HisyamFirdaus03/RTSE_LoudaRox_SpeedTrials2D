@@ -41,8 +41,22 @@ CONFIG = {
     "red":   [((0, 45, 60), (13, 255, 255)),        # low S floor -> catch pale/salmon reds
               ((163, 45, 60), (179, 255, 255))],
     "yellow":[((16, 70, 90), (35, 255, 255))],
+    # EV2 police car: a BLUE car on the road. Detecting it = the police event is
+    # live -> we must collect a RED within 5s (and not hit the car).
+    "police": [((100, 70, 40), (130, 255, 255))],
     # Use the narrow auto-calibrated file instead of the generous bands above?
     "use_calibration_file": False,
+
+    # ---- EV2 Police event ----------------------------------------------
+    "enable_police_event":   True,   # master toggle (flip False if it misbehaves)
+    "police_min_area_frac":  0.0040, # a police CAR is big -> require a sizable blue
+                                     # blob so stray blue pixels can't false-trigger
+    "police_min_cy_frac":    0.58,   # only count police in the NEAR half of the road;
+                                     # a tiny blue speck at the horizon must NOT trigger
+    "police_grab_secs":      5.0,    # seek/collect a red for this long after it appears
+    "police_weight":         5.0,    # how hard to avoid the police car (collision = GAME OVER)
+    "save_event_frames":     True,   # auto-save frames when police is detected -> police_frames/
+                                     # (so you can inspect the car without fast screenshots)
 
     # ---- Region of interest (the drivable road) ------------------------
     # A trapezoid: narrow near the horizon, wide near the car. Fractions of
@@ -266,12 +280,13 @@ class HeuristicPolicy(Policy):
         if config:
             self.cfg.update(config)                   # explicit overrides win
         self._prev_steer = 0.0
-        self._last_action = (0.0, self.cfg["accel_cruise"])   # held when a frame is torn
+        self._police_until = 0.0                              # EV2: seek-red deadline
+        self._last_save = 0.0                                 # rate-limit police-frame saves
         self._logger = DataLogger(self.cfg["log_dir"]) if self.cfg["log_data"] else None
 
     def reset(self):
         self._prev_steer = 0.0
-        self._last_action = (0.0, self.cfg["accel_cruise"])
+        self._police_until = 0.0
 
     # -- main entry ------------------------------------------------------
     def act(self, front_frame, back_frame=None):
@@ -286,15 +301,6 @@ class HeuristicPolicy(Policy):
         # ROI mask (the road trapezoid).
         roi_mask = np.zeros((h, w), np.uint8)
         cv2.fillPoly(roi_mask, [_roi_polygon(w, h)], 255)
-
-        # --- Torn-frame guard -------------------------------------------
-        # The camera stream occasionally delivers a partial (half-black) frame.
-        # Acting on it -> bad steering AND a false darkness-brake. If a big chunk
-        # is pure black, ignore this frame and hold the last good action.
-        if float(np.mean(np.all(front_frame <= 6, axis=2))) > 0.30:
-            steer, accel = self._last_action
-            self._maybe_debug(front_frame, roi_mask, {}, steer, "TORN FRAME->hold")
-            return steer, accel
 
         hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
 
@@ -329,34 +335,58 @@ class HeuristicPolicy(Policy):
         yellows= _detect_tokens(yellow_m, min_area, circ)
         for y in yellows:
             y["is_yellow"] = True
-        hazards = reds + yellows
 
-        # --- Plan a path through the whole token field ------------------
-        if not greens and not hazards:
-            # Nothing to chase or dodge -> just hold the lane (survival).
-            target_x = center_x + self._lane_keep(hsv, roi_mask, w, center_x) * (w * 0.5)
-            mode = "LANEKEEP"
+        # --- EV2 Police: a blue car on the road -> "collect a red within 5s" --
+        police = self._detect_police(hsv, road_region, w, h) if cfg["enable_police_event"] else []
+        for c in police:
+            c["is_police"] = True
+        if police:
+            self._police_until = time.time() + cfg["police_grab_secs"]   # (re)arm window
+            if cfg.get("save_event_frames") and time.time() - self._last_save > 0.4:
+                os.makedirs("police_frames", exist_ok=True)
+                cv2.imwrite(f"police_frames/police_{int(time.time()*1000)}.png", front_frame)
+                self._last_save = time.time()
+        grabbing_red = time.time() < self._police_until
+
+        # --- Plan a path ------------------------------------------------
+        if grabbing_red:
+            # INVERT: seek the nearest RED (treat it as the reward) while still
+            # avoiding the police car + yellows. This is what passes EV2.
+            avoid = police + yellows
+            if reds:
+                target_x = self._field_target(reds, avoid, h, w, center_x)
+                mode = "EV2:GRAB-RED"
+            else:
+                target_x = center_x + self._lane_keep(hsv, roi_mask, w, center_x) * (w * 0.5)
+                mode = "EV2:wait-red"
+            throttle_hazards = avoid
         else:
-            target_x = self._field_target(greens, hazards, h, w, center_x)
-            mode = "PLAN"
+            # Normal play. Police shouldn't appear here, but avoid it if it does.
+            hazards = reds + yellows + police
+            if not greens and not hazards:
+                target_x = center_x + self._lane_keep(hsv, roi_mask, w, center_x) * (w * 0.5)
+                mode = "LANEKEEP"
+            else:
+                target_x = self._field_target(greens, hazards, h, w, center_x)
+                mode = "PLAN"
+            throttle_hazards = hazards
 
         err = (target_x - center_x) / (w * 0.5)        # -1..1
         steer = self._smooth(_clamp(cfg["steer_gain"] * err))
 
-        # Adaptive throttle: full speed when clear, ease off smoothly as the
-        # nearest in-path hazard approaches -> gives steering time to dodge.
-        accel = self._throttle(hazards, h, w, center_x)
-        if accel < cfg["accel_cruise"] - 1e-3:
+        # Adaptive throttle: full speed when clear, ease off as the nearest
+        # in-path hazard approaches -> gives steering time to dodge.
+        accel = self._throttle(throttle_hazards, h, w, center_x)
+        if accel < cfg["accel_cruise"] - 1e-3 and not grabbing_red:
             mode = "PLAN!"
 
         if self._logger is not None:
             self._logger.log(front_frame, steer, accel)
 
         self._maybe_debug(front_frame, roi_mask,
-                          {"green": greens, "red": reds, "yellow": yellows},
+                          {"green": greens, "red": reds, "yellow": yellows, "police": police},
                           steer, mode, target_x=target_x,
                           masks={"green": green_m, "red": red_m, "yellow": yellow_m})
-        self._last_action = (steer, accel)            # remembered for torn-frame holds
         return steer, accel
 
     # -- behaviours ------------------------------------------------------
@@ -383,13 +413,28 @@ class HeuristicPolicy(Policy):
                                                          (2 * collect_sig ** 2))
             for hz in hazards:
                 prox = (hz["cy"] / h) ** 2
-                wgt = cfg["yellow_weight"] if hz.get("is_yellow") else 1.0
+                if hz.get("is_police"):
+                    wgt = cfg["police_weight"]      # collision = GAME OVER -> avoid hard
+                elif hz.get("is_yellow"):
+                    wgt = cfg["yellow_weight"]
+                else:
+                    wgt = 1.0
                 s -= cfg["hazard_penalty"] * wgt * prox * np.exp(-((cx - hz["cx"]) ** 2) /
                                                                  (2 * avoid_sig ** 2))
             # mild pull toward center so it doesn't wander when lanes are equal
             s -= cfg["lane_cost"] * abs(cx - center_x) / (0.5 * w)
             scores[i] = s
         return float(cands[int(np.argmax(scores))])
+
+    def _detect_police(self, hsv, road_region, w, h):
+        """Detect the blue police car on the road (EV2). Cars aren't round, so NO
+        circularity filter; require a sizable blob AND that it be in the near half
+        of the road, so a distant blue speck can't false-trigger the event."""
+        cfg = self.cfg
+        m = cv2.bitwise_and(_build_color_mask(hsv, cfg["police"]), road_region)
+        blobs = _detect_tokens(m, cfg["police_min_area_frac"] * (w * h), 0.0)
+        min_cy = cfg["police_min_cy_frac"] * h
+        return [b for b in blobs if b["cy"] >= min_cy]
 
     def _path_hazard(self, hazards, h, w, center_x):
         """Return the closest hazard that is both near and in our path, else None."""
@@ -455,7 +500,8 @@ class HeuristicPolicy(Policy):
         try:
             vis = frame.copy()
             h, w = vis.shape[:2]
-            colors = {"green": (0, 255, 0), "red": (0, 0, 255), "yellow": (0, 255, 255)}
+            colors = {"green": (0, 255, 0), "red": (0, 0, 255), "yellow": (0, 255, 255),
+                      "police": (255, 0, 0)}
             # Paint what each colour mask actually caught, so a mis-classified
             # token (e.g. a salmon red landing in the green mask) is obvious.
             if masks:
