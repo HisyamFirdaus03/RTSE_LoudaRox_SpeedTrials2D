@@ -37,10 +37,11 @@ CONFIG = {
     # saturation/brightness floor so the dull grey road and dark scenery are
     # excluded. The S/V floor is what separates tokens from background, NOT a
     # tight hue. Catches the pale translucent orbs too.
-    "green": [((32, 60, 60), (92, 255, 255))],
-    "red":   [((0, 45, 60), (13, 255, 255)),        # low S floor -> catch pale/salmon reds
-              ((163, 45, 60), (179, 255, 255))],
-    "yellow":[((16, 70, 90), (35, 255, 255))],
+    "green": [((32, 60, 50), (92, 255, 255))],
+    "red":   [((0, 35, 60), (13, 255, 255)),        # low S floor -> catch the pale specular
+              ((163, 35, 60), (179, 255, 255))],     # highlight on the glossy red sphere
+    "yellow":[((16, 70, 110), (35, 255, 255))],      # higher V floor -- gold coin is shinier
+                                                      # / brighter than the matte spheres
     # Use the narrow auto-calibrated file instead of the generous bands above?
     "use_calibration_file": False,
 
@@ -69,21 +70,19 @@ CONFIG = {
     "smoothing":      0.5,    # low-pass alpha: s = a*new + (1-a)*prev (higher = snappier)
     "center_x_frac":  0.5,    # where the car sits horizontally (bottom-center)
 
-    # ---- Potential-field path planner ----------------------------------
-    # Instead of reacting to ONE token, we score many candidate lateral paths:
-    # greens pull, hazards push (with a wider buffer), weighted by proximity.
-    # This threads between tokens instead of flip-flopping (which averaged to 0).
-    "n_candidates":     21,     # how many lateral target positions to score
+    # ---- Drive-to-token targeting ---------------------------------------
+    # Pick the real, detected green token worth chasing (closest + most
+    # reachable), then bias that target away from any hazard sitting in our
+    # way. No synthetic candidate sweep -- we steer at actual tokens.
     "cand_min_frac":    0.12,   # leftmost reachable target (fraction of W)
     "cand_max_frac":    0.88,   # rightmost reachable target
-    "green_reward":     1.2,    # attraction strength of a green token
-    "hazard_penalty":   3.6,    # repulsion strength of a red/yellow (> reward!)
-    "collect_sigma_frac": 0.06, # how close to a green's x counts as "collecting"
-    "avoid_sigma_frac":   0.11, # red no-go radius ~= car width. The car is ~1 lane
-                                # wide, so a green hugging a red CAN'T be taken
-                                # without clipping the red -> skip it. Avoiding red
-                                # is prioritised over grabbing a risky green.
-    "lane_cost":        0.3,    # penalty for steering far from center (lower = will take side lanes)
+    "lane_cost":        0.3,    # penalty for a green far from center (lower = will take side lanes)
+
+    # ---- Hazard avoidance ------------------------------------------------
+    "avoid_near_y_frac":  0.55,  # only swerve for hazards at least this far "ahead"
+                                  # (fraction of H, larger cy = closer to car)
+    "avoid_path_half_w":  0.30,  # lateral window (fraction of W) we consider "in our way"
+    "avoid_margin_frac":  0.16,  # how far to push the target away from the hazard
     "yellow_weight":    1.15,   # avoid yellow as hard as (or harder than) red: its
                                 # random debuff -- especially "lose colour vision" --
                                 # can blind a vision-based agent, so steer clear of it.
@@ -301,14 +300,22 @@ class HeuristicPolicy(Policy):
             y["is_yellow"] = True
         hazards = reds + yellows
 
-        # --- Plan a path through the whole token field ------------------
+        # --- Drive at the best real green token, swerving any hazard ----
         if not greens and not hazards:
             # Nothing to chase or dodge -> just hold the lane (survival).
             target_x = center_x + self._lane_keep(hsv, roi_mask, w, center_x) * (w * 0.5)
             mode = "LANEKEEP"
         else:
-            target_x = self._field_target(greens, hazards, h, w, center_x)
-            mode = "PLAN"
+            target = self._nearest_green(greens, h, w, center_x)
+            target_x = target["cx"] if target is not None else center_x
+            mode = "SEEK" if target is not None else "AVOID"
+
+            offset, hz = self._avoid_offset(hazards, h, w, center_x)
+            if hz is not None:
+                target_x += offset
+                mode = "SEEK+AVOID" if target is not None else "AVOID"
+
+            target_x = _clamp(target_x, cfg["cand_min_frac"] * w, cfg["cand_max_frac"] * w)
 
         err = (target_x - center_x) / (w * 0.5)        # -1..1
         steer = self._smooth(_clamp(cfg["steer_gain"] * err))
@@ -317,7 +324,7 @@ class HeuristicPolicy(Policy):
         accel = cfg["accel_cruise"]
         if self._path_hazard(hazards, h, w, center_x) is not None:
             accel = cfg["accel_dodge"]
-            mode = "PLAN!"
+            mode += "!"
 
         if self._logger is not None:
             self._logger.log(front_frame, steer, accel)
@@ -329,36 +336,38 @@ class HeuristicPolicy(Policy):
         return steer, accel
 
     # -- behaviours ------------------------------------------------------
-    def _field_target(self, greens, hazards, h, w, center_x):
-        """
-        Score candidate lateral target positions and return the best one.
-        Greens add reward, hazards subtract a (larger, wider) penalty, both
-        weighted by proximity (closer tokens matter more). A mild lane cost
-        keeps us from swinging wider than necessary. The argmax is the path
-        that grabs the most green while steering clear of red/yellow.
-        """
+    def _nearest_green(self, greens, h, w, center_x):
+        """Pick the green worth chasing: closer to the car (larger cy) and
+        more reachable (small lateral offset) wins. Returns None if no green
+        is detected this frame."""
+        if not greens:
+            return None
         cfg = self.cfg
-        cands = np.linspace(cfg["cand_min_frac"] * w, cfg["cand_max_frac"] * w,
-                            cfg["n_candidates"])
-        collect_sig = cfg["collect_sigma_frac"] * w
-        avoid_sig = cfg["avoid_sigma_frac"] * w
 
-        scores = np.zeros_like(cands)
-        for i, cx in enumerate(cands):
-            s = 0.0
-            for g in greens:
-                prox = (g["cy"] / h) ** 2               # near tokens dominate
-                s += cfg["green_reward"] * prox * np.exp(-((cx - g["cx"]) ** 2) /
-                                                         (2 * collect_sig ** 2))
-            for hz in hazards:
-                prox = (hz["cy"] / h) ** 2
-                wgt = cfg["yellow_weight"] if hz.get("is_yellow") else 1.0
-                s -= cfg["hazard_penalty"] * wgt * prox * np.exp(-((cx - hz["cx"]) ** 2) /
-                                                                 (2 * avoid_sig ** 2))
-            # mild pull toward center so it doesn't wander when lanes are equal
-            s -= cfg["lane_cost"] * abs(cx - center_x) / (0.5 * w)
-            scores[i] = s
-        return float(cands[int(np.argmax(scores))])
+        def score(g):
+            prox = (g["cy"] / h) ** 2
+            lateral = abs(g["cx"] - center_x) / (0.5 * w)
+            return prox - cfg["lane_cost"] * lateral
+
+        return max(greens, key=score)
+
+    def _avoid_offset(self, hazards, h, w, center_x):
+        """If a red/yellow hazard is close and roughly in our way, return a
+        lateral push (away from it, toward whichever side has more room) and
+        the hazard itself. Returns (0.0, None) when nothing nearby needs
+        dodging. Yellow pushes harder than red since its debuff is worse."""
+        cfg = self.cfg
+        near_y = h * cfg["avoid_near_y_frac"]
+        path_w = w * cfg["avoid_path_half_w"]
+        in_way = [hz for hz in hazards
+                  if hz["cy"] >= near_y and abs(hz["cx"] - center_x) <= path_w]
+        if not in_way:
+            return 0.0, None
+        hz = _closest(in_way)
+        weight = cfg["yellow_weight"] if hz.get("is_yellow") else 1.0
+        margin = w * cfg["avoid_margin_frac"] * weight
+        direction = -1.0 if hz["cx"] >= center_x else 1.0
+        return direction * margin, hz
 
     def _path_hazard(self, hazards, h, w, center_x):
         """Return the closest hazard that is both near and in our path, else None."""
