@@ -13,8 +13,9 @@ Flow:
      full of green tokens, so this also feeds the greedy/Tactical goal.
   4. When the timer expires, if the car is in the target lane, latch "golden".
 
-Verify-in-game: WHERE the announcement text is drawn (FLASH_ROI) and its colour.
-Defaults scan a central band for bright text; adjust once observed.
+Observed in-game: "LANE N -- ALL GREEN! (3s)" flashes in yellow just above the
+EV1..EV5 row. flash_roi/hue CFG below are tuned to that; re-verify if the layout
+changes.
 """
 
 import time
@@ -25,10 +26,15 @@ from event_manager import Override
 from hud import load_atlas, _segment_digits, _canon
 
 CFG = {
-    # Region (fractions of W,H) to scan for the flashed instruction. VERIFY in-game.
-    "flash_roi": (0.20, 0.25, 0.80, 0.55),   # (x0,y0,x1,y1)
-    "bright_v_min": 180,    # text is bright -> high V
-    "bright_s_max": 80,     # ...and fairly desaturated (white/pale). Loosen if golden.
+    # Region (fractions of W,H) to scan for the flashed instruction. Observed: the
+    # banner reads "LANE N -- ALL GREEN! (3s)" in yellow, sitting just above the
+    # EV1..EV5 row (hud.py's EVENT_BOXES, y=88..110 of 480). Narrowed to just the
+    # "LANE N" portion so the "(3s)" countdown digit isn't mistaken for the lane.
+    "flash_roi": (0.30, 0.02, 0.80, 0.10),   # (x0,y0,x1,y1)
+    "hue_lo": 18,    # yellow text hue band (OpenCV H 0-179), matches hud.py's
+    "hue_hi": 38,    # COUNTER_HSV["yellow"] band
+    "sat_min": 100,
+    "val_min": 100,
     "match_min_score": 0.80,   # template-match confidence floor to trust a digit
     "hold_seconds": 5.0,    # the event's own 5s timer
     "cooldown_seconds": 8.0,   # ignore re-triggers for this long after a hold ends
@@ -102,8 +108,8 @@ class GoldenLaneController:
             return None
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv,
-                           np.array((0, 0, self.cfg["bright_v_min"]), np.uint8),
-                           np.array((179, self.cfg["bright_s_max"], 255), np.uint8))
+                           np.array((self.cfg["hue_lo"], self.cfg["sat_min"], self.cfg["val_min"]), np.uint8),
+                           np.array((self.cfg["hue_hi"], 255, 255), np.uint8))
         best_d, best_score = None, self.cfg["match_min_score"]
         for _, dcrop in _segment_digits(mask):
             d, score = self._match(dcrop)
