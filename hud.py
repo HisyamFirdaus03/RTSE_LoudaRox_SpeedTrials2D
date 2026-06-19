@@ -47,6 +47,42 @@ COUNTER_BOXES = {
 # samples for the atlas -- not needed for the reward itself.
 DISTANCE_BOX = (555, 76, 618, 98)
 
+# EV1..EV5 event-status indicators across the top-center (label colour reflects
+# event state). Small sample boxes at 640x480, measured off the in-game frame.
+# All red == none passed; we treat a box turning GREEN as "event passed".
+# VERIFY the green=passed semantics and exact boxes against a live event.
+EVENT_BOXES = {
+    "EV1": (200, 88, 236, 110),
+    "EV2": (250, 88, 286, 110),
+    "EV3": (300, 88, 336, 110),
+    "EV4": (350, 88, 386, 110),
+    "EV5": (398, 88, 434, 110),
+}
+
+
+def read_event_status(frame):
+    """Classify each EV1..EV5 indicator as 'green' / 'red' / 'yellow' / 'off' by the
+    dominant hue of its vivid pixels. Used to track the Tactical 'passed' set."""
+    frame = _ensure_size(frame)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    out = {}
+    for name, (x0, y0, x1, y1) in EVENT_BOXES.items():
+        box = hsv[y0:y1, x0:x1]
+        vivid = box[(box[:, :, 1] > 80) & (box[:, :, 2] > 80)]
+        if len(vivid) < 8:
+            out[name] = "off"
+            continue
+        hmean = float(np.median(vivid[:, 0]))
+        if hmean < 12 or hmean > 160:
+            out[name] = "red"
+        elif 40 <= hmean <= 85:
+            out[name] = "green"
+        elif 16 <= hmean <= 35:
+            out[name] = "yellow"
+        else:
+            out[name] = "off"
+    return out
+
 # HSV colour bands isolating each bright counter digit (OpenCV H 0-179).
 COUNTER_HSV = {
     "green":  [((40, 120, 120), (85, 255, 255))],

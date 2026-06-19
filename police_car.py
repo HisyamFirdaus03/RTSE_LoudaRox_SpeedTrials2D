@@ -2,6 +2,7 @@ import time
 import cv2
 import numpy as np
 
+from event_manager import Override
 from agent_policy import (
     CONFIG,
     _build_color_mask,
@@ -187,6 +188,19 @@ class PoliceCarController:
         self._prev_mode = mode
         self._maybe_debug(front_frame, target, self.cop_box, steer, mode)
         return steer, accel
+
+    # -- arbiter interface (used by EventManager) ------------------------
+    def evaluate(self, front_frame, back_frame, ctx):
+        """Bid to take over while the cop is on screen. A close dead-ahead cop is a
+        game-over hazard -> priority 100 (collision dodge); otherwise seeking the red
+        token sits at 60. Returns None when no cop is present (policy passes through).
+        The Police pass (collecting a red within 5s) is latched by EventManager from
+        the HUD red-count tick while this handler is active."""
+        steer, accel = self.apply(front_frame, ctx.base_steer, ctx.base_accel)
+        if not self.police_active:
+            return None
+        pri = 100 if self._prev_mode == "COP-DODGE" else 60
+        return Override(steer, accel, pri, f"POLICE:{self._prev_mode}")
 
     # -- detection helpers ----------------------------------------------
     def _detect_cop(self, hsv, roi_mask, w, h):

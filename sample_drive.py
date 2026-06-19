@@ -10,18 +10,40 @@ import ctypes
 from agent_policy import HeuristicPolicy
 from low_light import LowLightController
 from police_car import PoliceCarController
+from chasing_car import ChasingCarController
+from golden_lane import GoldenLaneController
+from event_manager import EventManager
+from hud import load_atlas, read_counts, read_event_status
 
 # The swappable "brain". To upgrade later, change this one line to a trained
 # policy, e.g.  POLICY = LearnedPolicy("model.onnx")  -- nothing else changes.
 POLICY = HeuristicPolicy()
 
-# Challenge 1 (Low Light) handler -- a separate post-processing component that
-# overrides acceleration to recover the light when the screen goes dark.
-LOW_LIGHT = LowLightController()
+# Event handlers, each exposing evaluate(front, back, ctx) -> Override | None:
+#   LowLight   (EV1)  brake to recover the light when the screen goes dark.
+#   PoliceCar  (EV2)  grab a red token / dodge the cop (cop = game over).
+#   ChasingCar (EV3/4) evade cars closing from behind (reads the BACK camera).
+#   GoldenLane (EV5)  hold the announced lane until its 5s timer expires.
+HANDLERS = [
+    LowLightController(),
+    PoliceCarController(),
+    ChasingCarController(),
+    GoldenLaneController(),
+]
 
-# Challenge 3 (Police Car) handler -- a separate post-processing component that
-# takes over steering to grab a red token and dodge the cop while it is on-screen.
-POLICE = PoliceCarController()
+# Digit atlas for reading the on-screen score (HUD-OCR ground truth).
+HUD_ATLAS = load_atlas()
+
+
+def get_hud():
+    """Latest HUD snapshot (real on-screen counts) for the EventManager."""
+    with data_lock:
+        return shared_data.get('hud')
+
+
+# The arbiter: runs POLICY for a baseline, then lets the highest-priority active
+# event handler take over. Tracks the Tactical win condition from the HUD.
+EVENTS = EventManager(POLICY, HANDLERS, hud_getter=get_hud)
 
 # ---------------------------------------------------------
 # Configuration
@@ -37,7 +59,8 @@ shared_data = {
     'latest_front_frame': None,
     'latest_back_frame': None,
     'steering_input' : 0.0,
-    'acceleration_input' : 0.0
+    'acceleration_input' : 0.0,
+    'hud': None,            # latest {green,red,yellow,net} read off the screen
 }
 data_lock = threading.Lock()
 is_running = True
@@ -223,16 +246,28 @@ def processing_task():
         back_frame = shared_data['latest_back_frame']
 
     if front_frame is not None:
-        # Run the swappable policy: BGR frame in -> (steering, acceleration) out.
-        steering, acceleration = POLICY.act(front_frame, back_frame)
-        # Challenge 1 - Low Light: separate component overrides accel to recover the light.
-        steering, acceleration = LOW_LIGHT.apply(front_frame, steering, acceleration)
-        # Challenge 3 - Police Car: while the cop is on-screen, take over to grab a
-        # red token and dodge the cop; otherwise pass the policy's output through.
-        steering, acceleration = POLICE.apply(front_frame, steering, acceleration)
+        # The EventManager runs the baseline brain and lets the highest-priority
+        # active event handler (Darkness / Police / Chasing / Golden Lane) override.
+        steering, acceleration = EVENTS.act(front_frame, back_frame)
         with data_lock:
             shared_data['steering_input'] = steering
             shared_data['acceleration_input'] = acceleration
+
+
+def hud_task():
+    # Read the on-screen green/red/yellow counters (the real score) and publish a
+    # snapshot. Runs at a few Hz -- OCR is too heavy for the 200 Hz control loop.
+    with data_lock:
+        frame = shared_data['latest_front_frame']
+    if frame is None or not HUD_ATLAS:
+        return
+    counts = read_counts(frame, HUD_ATLAS)
+    g, r, y = counts.get('green'), counts.get('red'), counts.get('yellow')
+    net = (g - r) if (g is not None and r is not None) else None
+    events = read_event_status(frame)   # EV1..EV5 -> 'green'/'red'/'yellow'/'off'
+    with data_lock:
+        shared_data['hud'] = {'green': g, 'red': r, 'yellow': y, 'net': net,
+                              'events': events}
 
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
@@ -277,12 +312,15 @@ if __name__ == '__main__':
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
     t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
-    
+    # HUD-OCR feedback: read the real on-screen score at ~7 Hz, low priority.
+    t_hud = RTTask("ReadHUD", period=0.15, priority=TaskPriority.LOW, execute_func=hud_task)
+
     # Start tasks to run concurrently
     t_front_camera.start()
     t_back_camera.start()
     t_processing.start()
     t_controls.start()
+    t_hud.start()
     
     try:
         # You need this to keep the main thread alive, otherwise the program will exit immediately
@@ -297,6 +335,7 @@ if __name__ == '__main__':
     t_back_camera.join()
     t_processing.join()
     t_controls.join()
+    t_hud.join()
     
     # This is to close all the connections
     if front_camera_sock:

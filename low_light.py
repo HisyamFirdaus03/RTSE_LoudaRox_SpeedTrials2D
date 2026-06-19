@@ -23,6 +23,8 @@ recovers, the policy's normal output flows through unchanged.
 import cv2
 import numpy as np
 
+from event_manager import Override
+
 # Tunables -- calibrate on real frames if needed.
 DARK_THRESHOLD = 0.15   # mean brightness (0..1) below this => light is OFF (matches old code)
 RECOVER_ACCEL  = -1.0   # acceleration sent while dark to recover the light
@@ -55,3 +57,17 @@ class LowLightController:
         if self.is_dark:
             return steering, self.recover_accel   # steering unchanged; reverse to recover light
         return steering, acceleration
+
+    # -- arbiter interface (used by EventManager) ------------------------
+    def evaluate(self, front_frame, back_frame, ctx):
+        """While dark, bid to override acceleration to recover the light (steering
+        passes through). Priority 80: a collision dodge (100) still beats this, so
+        we never brake into a car closing from behind; we brake once clear."""
+        if front_frame is None:
+            return None
+        self.brightness = get_brightness(front_frame)
+        self.is_dark = self.brightness < self.dark_threshold
+        if self.is_dark:
+            ctx.passed.add("darkness")   # sending accel=-1.0 while dark passes the event
+            return Override(ctx.base_steer, self.recover_accel, 80, "DARK")
+        return None
