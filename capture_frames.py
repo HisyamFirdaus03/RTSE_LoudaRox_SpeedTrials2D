@@ -25,7 +25,7 @@ CAMERA_HOST = "127.0.0.1"
 FRONT_CAMERA_PORT = 8080
 
 OUT_DIR = "frames"
-NUM_FRAMES = 40          # how many to save
+NUM_FRAMES = 120         # how many to save (longer = distance shows all digits 0-9)
 INTERVAL = 0.5           # seconds between saves (spread them out for variety)
 
 

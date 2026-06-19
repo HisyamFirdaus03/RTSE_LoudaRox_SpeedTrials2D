@@ -8,10 +8,12 @@ import keyboard
 import select
 import ctypes
 from agent_policy import HeuristicPolicy
+import feedback
 
-# The swappable "brain". To upgrade later, change this one line to a trained
-# policy, e.g.  POLICY = LearnedPolicy("model.onnx")  -- nothing else changes.
 POLICY = HeuristicPolicy()
+
+# Reads the HUD score ~1x/sec and logs it to run_log.csv for measurable feedback.
+RUN_LOGGER = feedback.RunLogger()
 
 # ---------------------------------------------------------
 # Configuration
@@ -219,6 +221,12 @@ def processing_task():
             shared_data['steering_input'] = steering
             shared_data['acceleration_input'] = acceleration
 
+def stats_task():
+    # Low-priority feedback: read the HUD score once a second -> run_log.csv.
+    with data_lock:
+        front_frame = shared_data['latest_front_frame']
+    RUN_LOGGER.update(front_frame)
+
 def send_controls_task():
     #This is where you send the control commands to the car using the control_conn
     global control_conn
@@ -262,12 +270,14 @@ if __name__ == '__main__':
     t_back_camera = RTTask("ReadBackCamera", period=0.005, priority=TaskPriority.HIGH, execute_func=read_back_camera_task)
     t_processing = RTTask("Processing", period=0.005, priority=TaskPriority.MEDIUM, execute_func=processing_task)
     t_controls = RTTask("SendControls", period=0.005, priority=TaskPriority.HIGH, execute_func=send_controls_task)
-    
+    t_stats = RTTask("Stats", period=1.0, priority=TaskPriority.LOW, execute_func=stats_task)
+
     # Start tasks to run concurrently
     t_front_camera.start()
     t_back_camera.start()
     t_processing.start()
     t_controls.start()
+    t_stats.start()
     
     try:
         # You need this to keep the main thread alive, otherwise the program will exit immediately
@@ -282,7 +292,9 @@ if __name__ == '__main__':
     t_back_camera.join()
     t_processing.join()
     t_controls.join()
-    
+    t_stats.join()
+    RUN_LOGGER.close()
+
     # This is to close all the connections
     if front_camera_sock:
         front_camera_sock.close()

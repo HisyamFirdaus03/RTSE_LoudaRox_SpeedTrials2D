@@ -92,9 +92,14 @@ CONFIG = {
     "hazard_near_y_frac":  0.62,  # "close" = centroid below this fraction of H
     "hazard_path_half_w":  0.18,  # "in front" = |cx - center| < this * W
 
-    # ---- Acceleration --------------------------------------------------
-    "accel_cruise":   1.0,    # normal forward throttle
-    "accel_dodge":    0.65,   # ease off while making a hard dodge so it lands
+    # ---- Acceleration (adaptive throttle) ------------------------------
+    # Full speed when the road ahead is clear; ease off SMOOTHLY as the nearest
+    # in-path hazard gets closer, so the steering has time to dodge it. The car
+    # is ~1 lane wide and can't change lanes instantly -- slowing in danger is
+    # what actually prevents red hits (and a red also costs -20% speed, so this
+    # helps distance too).
+    "accel_cruise":   1.0,    # normal forward throttle (clear road)
+    "accel_dodge":    0.40,   # throttle when a hazard is right on top of us
 
     # ---- Road surface gate (tokens only exist ON the grey asphalt) -----
     # The grass is green and pollutes the green mask; the only reliable way to
@@ -105,6 +110,13 @@ CONFIG = {
     "road_val_min":   40,     # ...and not pitch black
     "road_dilate":    17,     # px to grow road mask; only needs to cover the thin
                               # colored token RIM (then _fill_blobs rebuilds the disk)
+
+    # ---- Special events ------------------------------------------------
+    # EV1 "Darkness": the whole screen goes dark and the rule is to brake fully
+    # (accel = -1). We detect it by mean brightness (V channel) collapsing well
+    # below a normal night scene. Tune this if it triggers in normal play (lower
+    # it) or never triggers during the dark event (raise it).
+    "darkness_v_mean": 45,
 
     # ---- Lane-keep fallback (no token actionable) ----------------------
     "lanekeep_gain":  0.6,    # gentle pull toward the road centroid
@@ -254,10 +266,12 @@ class HeuristicPolicy(Policy):
         if config:
             self.cfg.update(config)                   # explicit overrides win
         self._prev_steer = 0.0
+        self._last_action = (0.0, self.cfg["accel_cruise"])   # held when a frame is torn
         self._logger = DataLogger(self.cfg["log_dir"]) if self.cfg["log_data"] else None
 
     def reset(self):
         self._prev_steer = 0.0
+        self._last_action = (0.0, self.cfg["accel_cruise"])
 
     # -- main entry ------------------------------------------------------
     def act(self, front_frame, back_frame=None):
@@ -273,7 +287,23 @@ class HeuristicPolicy(Policy):
         roi_mask = np.zeros((h, w), np.uint8)
         cv2.fillPoly(roi_mask, [_roi_polygon(w, h)], 255)
 
+        # --- Torn-frame guard -------------------------------------------
+        # The camera stream occasionally delivers a partial (half-black) frame.
+        # Acting on it -> bad steering AND a false darkness-brake. If a big chunk
+        # is pure black, ignore this frame and hold the last good action.
+        if float(np.mean(np.all(front_frame <= 6, axis=2))) > 0.30:
+            steer, accel = self._last_action
+            self._maybe_debug(front_frame, roi_mask, {}, steer, "TORN FRAME->hold")
+            return steer, accel
+
         hsv = cv2.cvtColor(front_frame, cv2.COLOR_BGR2HSV)
+
+        # --- EV1 "Darkness" event: screen goes dark -> brake fully ------
+        # The event rule is to fully decelerate; not braking risks a penalty.
+        bright = float(hsv[:, :, 2].mean())
+        if bright < cfg["darkness_v_mean"]:
+            self._maybe_debug(front_frame, roi_mask, {}, 0.0, f"EV1 DARK({bright:.0f})->BRAKE")
+            return 0.0, -1.0
 
         # --- Degraded-vision check (yellow "lose colour" debuff) --------
         if cfg["blind_sat_mean"] > 0 and cv2.mean(hsv[:, :, 1])[0] < cfg["blind_sat_mean"]:
@@ -313,10 +343,10 @@ class HeuristicPolicy(Policy):
         err = (target_x - center_x) / (w * 0.5)        # -1..1
         steer = self._smooth(_clamp(cfg["steer_gain"] * err))
 
-        # Cut throttle if a hazard is close and nearly dead-ahead (panic brake).
-        accel = cfg["accel_cruise"]
-        if self._path_hazard(hazards, h, w, center_x) is not None:
-            accel = cfg["accel_dodge"]
+        # Adaptive throttle: full speed when clear, ease off smoothly as the
+        # nearest in-path hazard approaches -> gives steering time to dodge.
+        accel = self._throttle(hazards, h, w, center_x)
+        if accel < cfg["accel_cruise"] - 1e-3:
             mode = "PLAN!"
 
         if self._logger is not None:
@@ -326,6 +356,7 @@ class HeuristicPolicy(Policy):
                           {"green": greens, "red": reds, "yellow": yellows},
                           steer, mode, target_x=target_x,
                           masks={"green": green_m, "red": red_m, "yellow": yellow_m})
+        self._last_action = (steer, accel)            # remembered for torn-frame holds
         return steer, accel
 
     # -- behaviours ------------------------------------------------------
@@ -367,6 +398,19 @@ class HeuristicPolicy(Policy):
         in_path = [t for t in hazards
                    if t["cy"] >= near_y and abs(t["cx"] - center_x) <= path_w]
         return _closest(in_path)
+
+    def _throttle(self, hazards, h, w, center_x):
+        """Smoothly interpolate cruise->dodge throttle by how close the nearest
+        in-path hazard is. No hazard ahead -> full speed."""
+        cfg = self.cfg
+        threat = self._path_hazard(hazards, h, w, center_x)
+        if threat is None:
+            return cfg["accel_cruise"]
+        near_y = h * cfg["hazard_near_y_frac"]          # where "ahead" starts
+        bottom = h * cfg["roi_bottom_y"]                # closest the ROI sees
+        # prox: 0 when the hazard just enters the near zone, 1 when it's right on us
+        prox = float(np.clip((threat["cy"] - near_y) / max(1.0, bottom - near_y), 0.0, 1.0))
+        return cfg["accel_cruise"] + (cfg["accel_dodge"] - cfg["accel_cruise"]) * prox
 
     def _road_region(self, hsv, roi_mask):
         """Grey-asphalt mask, dilated to cover on-road tokens, ANDed with the ROI.
@@ -437,33 +481,6 @@ class HeuristicPolicy(Policy):
             cv2.waitKey(1)
         except Exception:
             pass
-
-
-# =========================================================================
-# LearnedPolicy -- future upgrade (same interface, swap one line upstream)
-# =========================================================================
-class LearnedPolicy(Policy):
-    """
-    Placeholder for a trained model (e.g. a small CNN trained by imitation
-    learning on data captured via DataLogger, then optionally fine-tuned).
-
-    Implement load() + act() and swap `HeuristicPolicy` for `LearnedPolicy`
-    in sample_drive.py. The contract is identical: BGR frame in, (steer, accel)
-    out in [-1, 1].
-    """
-
-    def __init__(self, model_path=None):
-        self.model = None
-        if model_path:
-            self.load(model_path)
-
-    def load(self, model_path):
-        # TODO: e.g. cv2.dnn.readNetFromONNX(model_path), or torch.load(...)
-        raise NotImplementedError("Train a model first; see DataLogger output.")
-
-    def act(self, front_frame, back_frame=None):
-        raise NotImplementedError
-
 
 # =========================================================================
 # DataLogger -- captures play for future imitation learning (off by default)
