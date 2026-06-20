@@ -50,6 +50,20 @@ FAR_LANE_ERR     = 0.42   # lower = commits full steer sooner (was 0.45)
 MULTI_LANE_HOLD  = 0.45   # seconds to lock full steer when crossing 2+ lanes to a green token
 NUM_LANES        = 5      # number of drivable lanes across the road
 
+# Golden Lane event ("LANE N — ALL GREEN! (Ts)" banner).
+# Displayed lane numbers are 1-5; internal lanes (get_lane) are 0-indexed.
+# Fractions below are estimated from screenshots of the banner — tune against
+# the live "Autonomous Debug" overlay if the boxes don't land on the digits.
+GOLDEN_LANE_DURATION   = 5.0
+BANNER_Y0, BANNER_Y1   = 0.0, 0.045    # banner text row, as a fraction of frame height
+LANE_DIGIT_X0, LANE_DIGIT_X1       = 0.42, 0.48     # the digit right after "LANE " (centre measured at 0.448)
+COUNTDOWN_DIGIT_X0, COUNTDOWN_DIGIT_X1 = 0.545, 0.605   # the digit inside "(Ts)" (centre measured at 0.573)
+# Lower V/S bounds than a typical "vivid" UI colour — at this tiny font size most
+# pixels are anti-aliased edges, not solid fill (measured samples: V=36-64, S=255).
+GOLD_TEXT_LOW  = np.array([0, 100, 25])
+GOLD_TEXT_HIGH = np.array([35, 255, 255])
+DIGIT_TEMPLATE_SIZE = (24, 32)   # (w, h) canonical size digit crops are resized to
+
 game_state = {
     'police_active':      False,
     'fast_car_active':    False,
@@ -73,6 +87,11 @@ game_state = {
     # for up to 0.5 s even if the token briefly disappears (collected / occluded)
     'target_x':          None,
     'target_commit_end': 0.0,
+    # Golden Lane event
+    'golden_active':       False,
+    'golden_lane_idx':     None,   # 0-based internal lane, or None if unread/unknown
+    'golden_calib_start':  None,   # wall time the banner first appeared (for digit auto-calibration)
+    'golden_digit_templates': {},  # {1..5: canonical-size binary glyph crop}
 }
 state_lock = threading.Lock()
 
@@ -208,7 +227,7 @@ def on_debug_mouse(event, x, y, _flags, _param):
     fy = min(int(y * fh / 480), fh - 1)
     bgr   = frame[fy, fx]
     hsv_px = cv2.cvtColor(np.array([[bgr]], dtype=np.uint8), cv2.COLOR_BGR2HSV)[0][0]
-    print(f"[SAMPLER] pos=({fx},{fy})  "
+    print(f"[SAMPLER] pos=({fx},{fy})  frac=({fx / fw:.3f},{fy / fh:.3f})  "
           f"BGR=({int(bgr[0])},{int(bgr[1])},{int(bgr[2])})  "
           f"HSV=H:{hsv_px[0]} S:{hsv_px[1]} V:{hsv_px[2]}  "
           f"<-- paste into detect_tokens HSV range")
@@ -285,11 +304,13 @@ def detect_tokens(frame):
 
 def detect_back_events(back_frame):
     """
-    Returns (police_raw, fast_car_raw) — raw per-frame signals.
-    Callers use frame counters to confirm before treating as real events.
+    Returns (police_raw, fast_car_raw, pursuer_cx, frame_w) — raw per-frame signals.
+    pursuer_cx is the x-centroid (full-frame coords) of whichever pursuer was
+    detected this frame, or None if neither was. Callers use frame counters to
+    confirm before treating as real events.
     """
     if back_frame is None:
-        return False, False
+        return False, False, None, None
     h, w = back_frame.shape[:2]
 
     # Only the lower 40% of the back frame — a following car is close and low.
@@ -301,6 +322,10 @@ def detect_back_events(back_frame):
     # Night-sky blue and neon signs are far less saturated/bright → won't match.
     blue_mask = cv2.inRange(hsv, np.array([105, 180, 180]), np.array([135, 255, 255]))
     police_raw = cv2.countNonZero(blue_mask) > 600
+    pursuer_cx = None
+    if police_raw:
+        _, xs = np.nonzero(blue_mask)
+        pursuer_cx = int(xs.mean())
 
     # Fast car: compact blob with large area in the horizontal centre.
     # Road markings are thin lines (small contour area); a car is a solid block.
@@ -308,10 +333,50 @@ def detect_back_events(back_frame):
     roi     = gray[:, w // 4: 3 * w // 4]
     edges   = cv2.Canny(roi, 60, 160)
     cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    max_area = max((cv2.contourArea(c) for c in cnts), default=0)
+    best_c   = max(cnts, key=cv2.contourArea, default=None)
+    max_area = cv2.contourArea(best_c) if best_c is not None else 0
     fast_car_raw = (not police_raw) and (max_area > CAR_DETECT_AREA * 3)
+    if fast_car_raw:
+        M = cv2.moments(best_c)
+        if M['m00'] > 0:
+            pursuer_cx = int(M['m10'] / M['m00']) + w // 4   # back to full-frame x
 
-    return police_raw, fast_car_raw
+    return police_raw, fast_car_raw, pursuer_cx, w
+
+def _crop_digit_glyph(frame, x0_frac, x1_frac):
+    """
+    Crop the banner row at [BANNER_Y0,BANNER_Y1] x [x0_frac,x1_frac], isolate
+    gold/orange text, and return the glyph (union of all blobs in the crop —
+    at this font size a single digit often renders as several disconnected
+    anti-aliased fragments) resized to DIGIT_TEMPLATE_SIZE as a binary image,
+    or None if nothing is there (banner not currently showing in that slot).
+    """
+    h, w = frame.shape[:2]
+    y0, y1 = int(h * BANNER_Y0), int(h * BANNER_Y1)
+    x0, x1 = int(w * x0_frac), int(w * x1_frac)
+    band = frame[y0:y1, x0:x1]
+    if band.size == 0:
+        return None
+    hsv  = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, GOLD_TEXT_LOW, GOLD_TEXT_HIGH)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts or cv2.countNonZero(mask) < 2:
+        return None
+    bx, by, bw, bh = cv2.boundingRect(np.vstack(cnts))
+    glyph = mask[by:by + bh, bx:bx + bw]
+    return cv2.resize(glyph, DIGIT_TEMPLATE_SIZE, interpolation=cv2.INTER_NEAREST)
+
+def classify_digit(crop, templates):
+    """Return the best-matching digit (key of `templates`) for `crop`, or None
+    if there are no templates yet to compare against."""
+    if crop is None or not templates:
+        return None
+    best_digit, best_score = None, -1.0
+    for digit, tmpl in templates.items():
+        score = cv2.matchTemplate(crop, tmpl, cv2.TM_CCOEFF_NORMED)[0][0]
+        if score > best_score:
+            best_digit, best_score = digit, score
+    return best_digit
 
 def steer_toward(target_x, frame_w, target_y=None, frame_h=None):
     """
@@ -450,12 +515,27 @@ def draw_debug(frame, tokens, steer, gs):
         cv2.putText(dbg, f'Y{ln}', (cx - 10, cy + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 200, 255), 2)
 
+    # --- Golden Lane banner crop boxes (for tuning LANE_DIGIT_X*/COUNTDOWN_DIGIT_X*) ---
+    by0, by1 = int(h * BANNER_Y0), int(h * BANNER_Y1)
+    for x0f, x1f, label in ((LANE_DIGIT_X0, LANE_DIGIT_X1, 'LANE#'),
+                             (COUNTDOWN_DIGIT_X0, COUNTDOWN_DIGIT_X1, 'T')):
+        bx0, bx1 = int(w * x0f), int(w * x1f)
+        cv2.rectangle(dbg, (bx0, by0), (bx1, by1), (0, 215, 255), 1)
+        cv2.putText(dbg, label, (bx0, by0 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 215, 255), 1)
+    n_tmpl = len(gs.get('golden_digit_templates', {}))
+    golden_txt = (f"GOLDEN: lane={gs['golden_lane_idx']}" if gs.get('golden_active')
+                  else f"GOLDEN: calibrating {n_tmpl}/5" if n_tmpl else "GOLDEN: idle")
+    cv2.putText(dbg, golden_txt, (bx1 + 10, by1),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 215, 255), 1)
+
     # --- Status bar ---
     status_flags = [k.replace('effect_', '').upper() for k, v in gs.items()
                     if k.startswith('effect_') and v is True and k != 'effect_end']
     if gs['police_active']:   status_flags.insert(0, 'POLICE')
     if gs['fast_car_active']: status_flags.insert(0, 'FAST-CAR')
     if gs['low_brightness']:  status_flags.insert(0, 'DARK')
+    if gs.get('golden_active'): status_flags.insert(0, f"GOLDEN-L{gs['golden_lane_idx']}")
 
     cv2.putText(dbg, f"Steer: {steer:+.2f}",
                 (10, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2)
@@ -572,7 +652,7 @@ def processing_task():
     # Perception ----------------------------------------------------------------
     brightness       = get_brightness(front_frame)
     tokens           = detect_tokens(front_frame)
-    police, fast_car = detect_back_events(back_frame)
+    police, fast_car, pursuer_cx, back_w = detect_back_events(back_frame)
 
     w, h = tokens['w'], tokens['h']
 
@@ -605,9 +685,14 @@ def processing_task():
         fast_car_confirmed = gs['fast_car_frames'] >= 6
         if fast_car_confirmed and not gs['fast_car_active']:
             gs['fast_car_active']  = True
-            gs['lane_switch_dir']  = -1.0 if gs['lane_switch_dir'] >= 0 else 1.0
+            # Dodge away from the side the chasing car is actually on, instead
+            # of blindly alternating — alternating can swerve straight into it.
+            if pursuer_cx is not None and back_w:
+                gs['lane_switch_dir'] = 1.0 if pursuer_cx < back_w / 2 else -1.0
+            else:
+                gs['lane_switch_dir'] = -1.0 if gs['lane_switch_dir'] >= 0 else 1.0
             gs['lane_switch_end']  = now2 + LANE_SWITCH_HOLD
-            print("[Event] Fast car confirmed — switching lanes")
+            print(f"[Event] Fast car confirmed — dodging {'right' if gs['lane_switch_dir'] > 0 else 'left'}")
         elif not fast_car_confirmed:
             gs['fast_car_active'] = False
 
@@ -650,6 +735,33 @@ def processing_task():
             tokens['green']  = []
             tokens['red']    = []
 
+        # Golden Lane ("LANE N — ALL GREEN! (Ts)") detection + digit auto-calibration.
+        # The countdown digit always ticks 5,4,3,2,1 in lockstep with real time, so the
+        # first time the banner is ever seen we can label each countdown glyph purely
+        # from elapsed wall-clock time — no manual labelling, no OCR dependency. Those
+        # five learned glyphs are then reused to read the (differently-positioned) lane
+        # number digit via template matching.
+        countdown_crop = _crop_digit_glyph(front_frame, COUNTDOWN_DIGIT_X0, COUNTDOWN_DIGIT_X1)
+        lane_crop      = _crop_digit_glyph(front_frame, LANE_DIGIT_X0, LANE_DIGIT_X1)
+
+        if countdown_crop is not None and lane_crop is not None:
+            if gs['golden_calib_start'] is None:
+                gs['golden_calib_start'] = now2     # rising edge: countdown reads "5" right now
+            elapsed = now2 - gs['golden_calib_start']
+            span    = int(GOLDEN_LANE_DURATION)
+            expected_digit = max(1, min(span, span - int(elapsed)))
+            gs['golden_digit_templates'].setdefault(expected_digit, countdown_crop)
+
+            lane_digit = classify_digit(lane_crop, gs['golden_digit_templates'])
+            if lane_digit is not None and len(gs['golden_digit_templates']) >= span:
+                gs['golden_active']   = True
+                gs['golden_lane_idx'] = lane_digit - 1     # displayed 1-5 -> internal 0-4
+            else:
+                gs['golden_active'] = False    # not calibrated enough yet to trust a read
+        else:
+            gs['golden_calib_start'] = None
+            gs['golden_active']      = False
+
         # Steering priority order -----------------------------------------------
         if now2 < gs['lane_switch_end']:
             steer = gs['lane_switch_dir']                     # hold lane-switch steer
@@ -661,6 +773,13 @@ def processing_task():
             # Police active → must take nearest red token
             t = max(tokens['red'], key=lambda b: b[1])
             steer = steer_toward(t[0], w, t[1], h)
+
+        elif gs['golden_active'] and gs['golden_lane_idx'] is not None:
+            # Golden Lane → drive to and hold the announced lane until it ends
+            edge_px   = int(w * ROAD_EDGE_MARGIN)
+            lane_px   = (w - 2 * edge_px) / NUM_LANES
+            target_cx = int(edge_px + (gs['golden_lane_idx'] + 0.5) * lane_px)
+            steer = steer_toward(target_cx, w)
 
         else:
             # --- Lane-scoring decision ---
@@ -737,7 +856,7 @@ def processing_task():
         print("=" * 55)
         print(f"[CAR]  steering={steer:+.3f}  acceleration={accel:+.3f}")
         print(f"[CAM]  front_frame={'OK' if raw_front is not None else 'NONE'}"
-              f"  back_frame={'OK' if back_frame is not None else 'NONE'}")
+              f" ({w}x{h})  back_frame={'OK' if back_frame is not None else 'NONE'}")
         print(f"[SENS] brightness={brightness:.3f}  low_brightness={gs['low_brightness']}")
         print(f"[TOKS] green={len(tokens['green'])}  red={len(tokens['red'])}  yellow={len(tokens['yellow'])}")
         print(f"[EVT]  police={gs['police_active']}  fast_car={gs['fast_car_active']}")
@@ -746,6 +865,8 @@ def processing_task():
         print(f"       action_delay={gs['effect_action_delay']}  corrupted={gs['effect_corrupted']}"
               f"  ends_in={max(0.0, gs['effect_end'] - now2):.1f}s")
         print(f"[LANE] switch_active={now2 < gs['lane_switch_end']}  dir={gs['lane_switch_dir']:+.1f}")
+        print(f"[GOLD] active={gs['golden_active']}  lane_idx={gs['golden_lane_idx']}"
+              f"  templates={len(gs['golden_digit_templates'])}/5")
         print(f"[NET]  control_conn={'connected' if control_conn is not None else 'NONE'}"
               f"  front_sock={'connected' if front_camera_sock is not None else 'NONE'}"
               f"  back_sock={'connected' if back_camera_sock is not None else 'NONE'}")
