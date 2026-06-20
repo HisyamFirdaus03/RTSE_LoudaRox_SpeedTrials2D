@@ -54,7 +54,8 @@ CONFIG = {
     "police_min_cy_frac":    0.58,   # only count police in the NEAR half of the road;
                                      # a tiny blue speck at the horizon must NOT trigger
     "police_grab_secs":      5.0,    # seek/collect a red for this long after it appears
-    "police_weight":         5.0,    # how hard to avoid the police car (collision = GAME OVER)
+    "police_weight":         8.0,    # how hard to avoid the police car (collision = GAME OVER)
+    "police_sigma_mult":     2.2,    # police car is WIDER than a token -> wider no-go zone
     "save_event_frames":     True,   # auto-save frames when police is detected -> police_frames/
                                      # (so you can inspect the car without fast screenshots)
 
@@ -73,9 +74,10 @@ CONFIG = {
     "min_token_area_frac": 0.0006,  # ignore blobs smaller than this * (W*H)
     # After filling, tokens (even translucent ring-shaped ones) are round
     # disks; thin striped posts stay elongated. Kept LENIENT so real orbs are
-    # never dropped -- proximity weighting + ROI handle the rest. Raise toward
-    # 0.6 only if barriers clearly still pollute the masks.
-    "min_circularity": 0.42,
+    # never dropped (even partly clipped/occluded ones) -- the road-gate +
+    # colour already exclude grass/barriers. Raise toward 0.5 only if barriers
+    # clearly pollute the masks.
+    "min_circularity": 0.33,
 
     # ---- Steering ------------------------------------------------------
     "steer_gain":     2.2,    # P-gain on normalized horizontal error
@@ -356,6 +358,11 @@ class HeuristicPolicy(Policy):
             if reds:
                 target_x = self._field_target(reds, avoid, h, w, center_x)
                 mode = "EV2:GRAB-RED"
+            elif police:
+                # No red visible yet, but the police car IS here -> actively dodge
+                # it (don't lane-keep straight INTO it = GAME OVER).
+                target_x = self._field_target([], avoid, h, w, center_x)
+                mode = "EV2:DODGE-POLICE"
             else:
                 target_x = center_x + self._lane_keep(hsv, roi_mask, w, center_x) * (w * 0.5)
                 mode = "EV2:wait-red"
@@ -413,14 +420,16 @@ class HeuristicPolicy(Policy):
                                                          (2 * collect_sig ** 2))
             for hz in hazards:
                 prox = (hz["cy"] / h) ** 2
+                sig = avoid_sig
                 if hz.get("is_police"):
                     wgt = cfg["police_weight"]      # collision = GAME OVER -> avoid hard
+                    sig = avoid_sig * cfg["police_sigma_mult"]   # ...and a wider berth
                 elif hz.get("is_yellow"):
                     wgt = cfg["yellow_weight"]
                 else:
                     wgt = 1.0
                 s -= cfg["hazard_penalty"] * wgt * prox * np.exp(-((cx - hz["cx"]) ** 2) /
-                                                                 (2 * avoid_sig ** 2))
+                                                                 (2 * sig ** 2))
             # mild pull toward center so it doesn't wander when lanes are equal
             s -= cfg["lane_cost"] * abs(cx - center_x) / (0.5 * w)
             scores[i] = s
