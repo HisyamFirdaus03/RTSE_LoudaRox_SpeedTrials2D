@@ -8,9 +8,15 @@ import keyboard
 import select
 import ctypes
 from agent_policy import HeuristicPolicy
+from golden_lane import GoldenLaneController
 import feedback
 
 POLICY = HeuristicPolicy()
+
+# Golden Lane handler -- steers into the all-green lane while the event lasts.
+# LOWER steering priority than the chaser: it is applied BEFORE CHASER in
+# processing_task, so a rear-car dodge overrides a golden-lane move.
+GOLDEN_LANE = GoldenLaneController()
 
 # Reads the HUD score ~1x/sec and logs it to run_log.csv for measurable feedback.
 RUN_LOGGER = feedback.RunLogger()
@@ -217,6 +223,10 @@ def processing_task():
     if front_frame is not None:
         # Run the swappable policy: BGR frame in -> (steering, acceleration) out.
         steering, acceleration = POLICY.act(front_frame, back_frame)
+        # Golden Lane: steer into the all-green lane (steering only). Applied here so
+        # it is LOWER priority than the chaser -- when CHASER is re-added, chain its
+        # .apply(...) AFTER this line so the rear-car dodge overrides the lane move.
+        steering, acceleration = GOLDEN_LANE.apply(front_frame, steering, acceleration)
         with data_lock:
             shared_data['steering_input'] = steering
             shared_data['acceleration_input'] = acceleration

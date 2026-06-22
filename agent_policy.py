@@ -23,6 +23,8 @@ import time
 import cv2
 import numpy as np
 
+from chasing_car import ChasingCarController
+
 CALIBRATION_FILE = "color_calibration.json"
 
 
@@ -37,9 +39,17 @@ CONFIG = {
     # saturation/brightness floor so the dull grey road and dark scenery are
     # excluded. The S/V floor is what separates tokens from background, NOT a
     # tight hue. Catches the pale translucent orbs too.
-    "green": [((32, 60, 60), (92, 255, 255))],
-    "red":   [((0, 45, 60), (13, 255, 255)),        # low S floor -> catch pale/salmon reds
-              ((163, 45, 60), (179, 255, 255))],
+    # Green coin: main rgb(144,230,133)->H57 S108 V230, pale rgb(214,255,206)->
+    # H55 S49 V255. The S floor is dropped to 40 so the PALE coin (S~49) is no
+    # longer missed. Grass rgb(38,67,39)->H61 S110 V67 sits inside the green hue
+    # but is DARK, so the V floor is raised to 110 to reject it (coins are V>=230).
+    "green": [((38, 40, 110), (82, 255, 255))],
+    # Red coin: main rgb(233,124,121)->H1 S123 V233, pale rgb(255,205,207)->
+    # H179 S50 V255. The red CURB rgb(200,0,1)->H0/179 S255 V200 shares the hue
+    # but is FULLY saturated, so the S ceiling is capped at 200 to reject it
+    # while keeping the pale (S~50) and main (S~123) coins.
+    "red":   [((0, 40, 70), (13, 200, 255)),        # low S floor -> pale/salmon reds; S cap -> drop curb
+              ((160, 40, 70), (179, 200, 255))],
     "yellow":[((16, 70, 90), (35, 255, 255))],
     # EV2 police car: a BLUE car on the road. Detecting it = the police event is
     # live -> we must collect a RED within 5s (and not hit the car).
@@ -64,10 +74,10 @@ CONFIG = {
     # player's own red car (which sits at the bottom-center of the front
     # camera) -- otherwise the car's red body reads as a permanent red hazard
     # and its orange lights as yellow. roi_bottom_y crops the car out.
-    "roi_top_y":      0.45,   # horizon side
-    "roi_bottom_y":   0.80,   # just above the player's car (was 0.98 = included it)
-    "roi_top_half_w": 0.12,   # half-width at the top, fraction of W
-    "roi_bot_half_w": 0.44,   # half-width at the bottom, fraction of W
+    "roi_top_y":      0.40,   # horizon side (raised -> see tokens further ahead)
+    "roi_bottom_y":   0.85,   # just above the player's car (was 0.98 = included it)
+    "roi_top_half_w": 0.18,   # half-width at the top, fraction of W (wider)
+    "roi_bot_half_w": 0.48,   # half-width at the bottom, fraction of W (wider)
 
     # ---- Detection -----------------------------------------------------
     "min_token_area_frac": 0.0006,  # ignore blobs smaller than this * (W*H)
@@ -282,11 +292,13 @@ class HeuristicPolicy(Policy):
         self._prev_steer = 0.0
         self._police_until = 0.0                              # EV2: seek-red deadline
         self._last_save = 0.0                                 # rate-limit police-frame saves
+        self._chaser = ChasingCarController()                 # EV3: back-camera chasing car
         self._logger = DataLogger(self.cfg["log_dir"]) if self.cfg["log_data"] else None
 
     def reset(self):
         self._prev_steer = 0.0
         self._police_until = 0.0
+        self._chaser.reset()
 
     # -- main entry ------------------------------------------------------
     def act(self, front_frame, back_frame=None):
@@ -379,6 +391,18 @@ class HeuristicPolicy(Policy):
         accel = self._throttle(throttle_hazards, h, w, center_x)
         if accel < cfg["accel_cruise"] - 1e-3 and not grabbing_red:
             mode = "PLAN!"
+
+        # --- EV3 Chasing car (back camera) ------------------------------
+        # A teal car tails us; a hit costs 50% speed. The controller overrides
+        # STEERING ONLY to swerve aside (accel passes through). PRIORITY: the
+        # police event (EV2) outranks this -- only let it override when no police
+        # event is live, so we never break the red-grab behaviour.
+        police_active = grabbing_red or bool(police)
+        if not police_active:
+            steer, accel = self._chaser.apply(back_frame, steer, accel)
+            if self._chaser.evading:
+                mode = "EV-CHASE"
+                self._prev_steer = steer        # keep the smoother in sync
 
         if self._logger is not None:
             self._logger.log(front_frame, steer, accel)
